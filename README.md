@@ -20,6 +20,19 @@ The scaffold is intentionally conservative:
 - additive boot-entry model only
 - no repartitioning and no BIOS/MBR support
 
+## Probe behavior
+
+`partbooter probe` now performs a live Windows host inspection via native
+PowerShell/Storage cmdlets when run on Windows. It collects:
+
+- firmware mode
+- system disk partition style
+- Secure Boot state
+- BitLocker presence
+- EFI System Partition details
+
+Non-Windows hosts fail fast because live probing is Windows-only.
+
 ## Commands
 
 ```text
@@ -34,6 +47,9 @@ partbooter repair --latest
 
 The helper binary mirrors the privileged lifecycle surface and is the future
 transport boundary for Windows elevation/service integration.
+
+`apply`, `verify`, `rollback`, and `repair` still operate as scaffolded journal
+and plan lifecycle commands. Real ESP/BCD mutation remains a later milestone.
 
 ## Build
 

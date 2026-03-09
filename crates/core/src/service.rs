@@ -13,19 +13,43 @@ use partbooter_payload_winpe as winpe;
 use partbooter_windows::WindowsProbeAdapter;
 
 #[derive(Debug, Clone)]
+enum ProbeSource {
+    Live,
+    #[cfg(test)]
+    Fixture(partbooter_common::MachineProbe),
+}
+
+#[derive(Debug, Clone)]
 pub struct PartBooterService {
     journal_store: FileJournalStore,
+    probe_source: ProbeSource,
 }
 
 impl PartBooterService {
     pub fn new(state_root: impl Into<PathBuf>) -> Self {
         Self {
             journal_store: FileJournalStore::new(state_root.into()),
+            probe_source: ProbeSource::Live,
         }
     }
 
-    pub fn probe_machine(&self) -> partbooter_common::MachineProbe {
-        WindowsProbeAdapter::probe()
+    #[cfg(test)]
+    pub fn with_probe_fixture(
+        state_root: impl Into<PathBuf>,
+        probe: partbooter_common::MachineProbe,
+    ) -> Self {
+        Self {
+            journal_store: FileJournalStore::new(state_root.into()),
+            probe_source: ProbeSource::Fixture(probe),
+        }
+    }
+
+    pub fn probe_machine(&self) -> AppResult<partbooter_common::MachineProbe> {
+        match &self.probe_source {
+            ProbeSource::Live => WindowsProbeAdapter::probe(),
+            #[cfg(test)]
+            ProbeSource::Fixture(probe) => Ok(probe.clone()),
+        }
     }
 
     pub fn inspect_payload(&self, source_path: impl AsRef<Path>) -> PayloadSpec {
@@ -55,7 +79,7 @@ impl PartBooterService {
         source_path: impl AsRef<Path>,
         target_volume: impl Into<String>,
     ) -> AppResult<ExecutionPlan> {
-        let probe = self.probe_machine();
+        let probe = self.probe_machine()?;
         let payload = self.inspect_payload(source_path);
 
         self.validate_probe(&probe)?;
@@ -76,6 +100,28 @@ impl PartBooterService {
             level: RiskLevel::Info,
             message: "PartBooter will only add a boot entry and will not replace the current default path.".to_string(),
         }];
+
+        if probe.bitlocker_detected {
+            risk_flags.push(RiskFlag {
+                code: "bitlocker-detected".to_string(),
+                level: RiskLevel::Warning,
+                message:
+                    "BitLocker-protected volumes were detected; review suspension and recovery requirements before apply."
+                        .to_string(),
+            });
+        }
+
+        risk_flags.extend(
+            probe
+                .warnings
+                .iter()
+                .enumerate()
+                .map(|(index, warning)| RiskFlag {
+                    code: format!("probe-warning-{}", index + 1),
+                    level: RiskLevel::Warning,
+                    message: warning.clone(),
+                }),
+        );
 
         if probe.secure_boot_enabled && payload.kind == PayloadKind::LinuxIso {
             risk_flags.push(RiskFlag {
@@ -251,6 +297,12 @@ impl PartBooterService {
     }
 
     fn validate_probe(&self, probe: &partbooter_common::MachineProbe) -> AppResult<()> {
+        if !probe.supported {
+            return Err(AppError::new(
+                AppErrorKind::UnsupportedEnvironment,
+                "PartBooter probe reported an unsupported host configuration",
+            ));
+        }
         if probe.firmware_mode != partbooter_common::FirmwareMode::Uefi {
             return Err(AppError::new(
                 AppErrorKind::UnsupportedEnvironment,
@@ -261,6 +313,12 @@ impl PartBooterService {
             return Err(AppError::new(
                 AppErrorKind::UnsupportedEnvironment,
                 "PartBooter v1 only supports GPT disks",
+            ));
+        }
+        if probe.esp.volume.trim().is_empty() {
+            return Err(AppError::new(
+                AppErrorKind::UnsupportedEnvironment,
+                "PartBooter could not resolve the EFI System Partition volume path",
             ));
         }
         Ok(())
@@ -296,7 +354,10 @@ fn iso_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::PartBooterService;
-    use partbooter_common::{OperationStatus, PayloadKind};
+    use partbooter_common::{
+        EspInfo, FirmwareMode, HostPlatform, MachineProbe, OperationStatus, PartitionStyle,
+        PayloadKind,
+    };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -308,9 +369,27 @@ mod tests {
         std::env::temp_dir().join(format!("partbooter-core-test-{unique}"))
     }
 
+    fn supported_probe_fixture() -> MachineProbe {
+        MachineProbe {
+            host_platform: HostPlatform::Windows,
+            firmware_mode: FirmwareMode::Uefi,
+            partition_style: PartitionStyle::Gpt,
+            secure_boot_enabled: true,
+            bitlocker_detected: false,
+            esp: EspInfo {
+                volume: "\\\\?\\Volume{ESP}".to_string(),
+                mount_point: "S:\\".to_string(),
+                filesystem: "FAT32".to_string(),
+                free_space_mb: 512,
+            },
+            warnings: Vec::new(),
+            supported: true,
+        }
+    }
+
     #[test]
     fn builds_supported_linux_plan() {
-        let service = PartBooterService::new(temp_root());
+        let service = PartBooterService::with_probe_fixture(temp_root(), supported_probe_fixture());
         let plan = service
             .build_plan("C:\\images\\ubuntu-24.04.iso", "D:")
             .expect("plan should succeed");
@@ -322,7 +401,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_payload() {
-        let service = PartBooterService::new(temp_root());
+        let service = PartBooterService::with_probe_fixture(temp_root(), supported_probe_fixture());
         let error = service
             .build_plan("C:\\images\\unknown.iso", "D:")
             .expect_err("unknown payload should fail");
@@ -331,7 +410,7 @@ mod tests {
 
     #[test]
     fn applies_and_verifies_operation() {
-        let service = PartBooterService::new(temp_root());
+        let service = PartBooterService::with_probe_fixture(temp_root(), supported_probe_fixture());
         let plan = service
             .build_plan("C:\\images\\winpe_boot.wim", "D:")
             .expect("plan should succeed");
@@ -342,5 +421,21 @@ mod tests {
             .verify_operation(&journal.operation_id)
             .expect("verify should succeed");
         assert!(report.verified);
+    }
+
+    #[test]
+    fn rejects_unsupported_probe_fixture() {
+        let mut probe = supported_probe_fixture();
+        probe.firmware_mode = FirmwareMode::Bios;
+        probe.supported = false;
+        probe
+            .warnings
+            .push("Firmware mode is not UEFI.".to_string());
+
+        let service = PartBooterService::with_probe_fixture(temp_root(), probe);
+        let error = service
+            .build_plan("C:\\images\\winpe_boot.wim", "D:")
+            .expect_err("unsupported host probe should fail");
+        assert_eq!(error.exit_code(), 2);
     }
 }

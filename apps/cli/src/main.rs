@@ -24,7 +24,7 @@ fn run() -> Result<(), AppError> {
     match args[0].as_str() {
         "probe" => {
             let json = args.iter().any(|arg| arg == "--json");
-            let probe = service.probe_machine();
+            let probe = service.probe_machine()?;
             if json {
                 println!("{}", probe.to_json());
             } else {
