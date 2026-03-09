@@ -1,0 +1,13 @@
+[package]
+name = "partbooter-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+partbooter-common = { path = "../common" }
+
+[lib]
+name = "partbooter_windows"
+path = "src/lib.rs"
+

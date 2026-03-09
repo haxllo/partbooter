@@ -1,0 +1,14 @@
+[package]
+name = "partbooter-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+partbooter-common = { path = "../../crates/common" }
+partbooter-core = { path = "../../crates/core" }
+
+[[bin]]
+name = "partbooter-helper"
+path = "src/main.rs"
+

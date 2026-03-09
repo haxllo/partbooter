@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "apps/cli",
+    "apps/helper",
+    "crates/common",
+    "crates/core",
+    "crates/journal",
+    "crates/payloads/linux-iso",
+    "crates/payloads/winpe",
+    "crates/windows",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+

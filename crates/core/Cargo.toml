@@ -1,0 +1,17 @@
+[package]
+name = "partbooter-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+partbooter-common = { path = "../common" }
+partbooter-journal = { path = "../journal" }
+partbooter-payload-linux-iso = { path = "../payloads/linux-iso" }
+partbooter-payload-winpe = { path = "../payloads/winpe" }
+partbooter-windows = { path = "../windows" }
+
+[lib]
+name = "partbooter_core"
+path = "src/lib.rs"
+

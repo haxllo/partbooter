@@ -1,0 +1,13 @@
+[package]
+name = "partbooter-payload-linux-iso"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+partbooter-common = { path = "../../common" }
+
+[lib]
+name = "partbooter_payload_linux_iso"
+path = "src/lib.rs"
+

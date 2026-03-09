@@ -1,0 +1,13 @@
+[package]
+name = "partbooter-payload-winpe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+partbooter-common = { path = "../../common" }
+
+[lib]
+name = "partbooter_payload_winpe"
+path = "src/lib.rs"
+
