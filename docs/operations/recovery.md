@@ -44,7 +44,7 @@ Symptoms:
 
 - managed entry missing
 - backup manifest or BCD snapshot missing
-- staged artifacts incomplete in later milestones
+- staged WinPE artifacts incomplete or removed
 
 Action:
 

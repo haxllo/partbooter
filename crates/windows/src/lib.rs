@@ -137,6 +137,21 @@ pub struct BackupCheckpoint {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WinPeStaging {
+    pub stage_root: PathBuf,
+    pub boot_wim_path: PathBuf,
+    pub boot_sdi_path: PathBuf,
+    pub target_volume: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BootEntryRegistration {
+    pub entry_id: String,
+    pub ramdisk_options_id: String,
+    pub display_name: String,
+}
+
 pub struct WindowsApplyAdapter;
 
 impl WindowsApplyAdapter {
@@ -145,6 +160,33 @@ impl WindowsApplyAdapter {
         backup_root: impl AsRef<Path>,
     ) -> AppResult<BackupCheckpoint> {
         create_backup_checkpoint_impl(esp, backup_root.as_ref())
+    }
+
+    pub fn stage_winpe_payload(
+        source_wim: impl AsRef<Path>,
+        target_volume: &str,
+        operation_id: &str,
+    ) -> AppResult<WinPeStaging> {
+        stage_winpe_payload_impl(source_wim.as_ref(), target_volume, operation_id)
+    }
+
+    pub fn register_winpe_boot_entry(
+        staging: &WinPeStaging,
+        display_name: &str,
+    ) -> AppResult<BootEntryRegistration> {
+        register_winpe_boot_entry_impl(staging, display_name)
+    }
+
+    pub fn verify_boot_entry(entry_id: &str) -> AppResult<bool> {
+        verify_boot_entry_impl(entry_id)
+    }
+
+    pub fn remove_boot_entry(entry_id: &str, ramdisk_options_id: &str) -> AppResult<()> {
+        remove_boot_entry_impl(entry_id, ramdisk_options_id)
+    }
+
+    pub fn remove_staged_payload(stage_root: impl AsRef<Path>) -> AppResult<()> {
+        remove_staged_payload_impl(stage_root.as_ref())
     }
 }
 
@@ -267,9 +309,308 @@ fn create_backup_checkpoint_impl(
 }
 
 #[cfg(windows)]
+fn stage_winpe_payload_impl(
+    source_wim: &Path,
+    target_volume: &str,
+    operation_id: &str,
+) -> AppResult<WinPeStaging> {
+    let target_root = normalize_volume_root(target_volume)?;
+    let stage_root = target_root
+        .join("PartBooter")
+        .join("Operations")
+        .join(operation_id)
+        .join("WinPE");
+    fs::create_dir_all(&stage_root)?;
+
+    let boot_wim_path = stage_root.join("boot.wim");
+    fs::copy(source_wim, &boot_wim_path).map_err(|error| {
+        AppError::new(
+            AppErrorKind::Io,
+            format!(
+                "failed to stage WinPE WIM from {} to {}: {error}",
+                source_wim.display(),
+                boot_wim_path.display()
+            ),
+        )
+    })?;
+
+    let boot_sdi_source = locate_boot_sdi_source()?;
+    let boot_sdi_path = stage_root.join("boot.sdi");
+    fs::copy(&boot_sdi_source, &boot_sdi_path).map_err(|error| {
+        AppError::new(
+            AppErrorKind::Io,
+            format!(
+                "failed to stage boot.sdi from {} to {}: {error}",
+                boot_sdi_source.display(),
+                boot_sdi_path.display()
+            ),
+        )
+    })?;
+
+    Ok(WinPeStaging {
+        stage_root,
+        boot_wim_path,
+        boot_sdi_path,
+        target_volume: normalized_volume_token(target_volume)?,
+    })
+}
+
+#[cfg(not(windows))]
+fn stage_winpe_payload_impl(
+    _source_wim: &Path,
+    _target_volume: &str,
+    _operation_id: &str,
+) -> AppResult<WinPeStaging> {
+    Err(AppError::new(
+        AppErrorKind::UnsupportedEnvironment,
+        "PartBooter WinPE staging only runs on Windows hosts",
+    ))
+}
+
+#[cfg(windows)]
+fn register_winpe_boot_entry_impl(
+    staging: &WinPeStaging,
+    display_name: &str,
+) -> AppResult<BootEntryRegistration> {
+    let entry_id = create_bcd_object(display_name, "osloader")?;
+    let ramdisk_options_id = create_device_options_object(&format!("{display_name} options"))?;
+
+    let volume_token = &staging.target_volume;
+    let ramdisk_sdi_path = windows_volume_relative_path(&staging.boot_sdi_path, volume_token)?;
+    let ramdisk_wim_path = windows_volume_relative_path(&staging.boot_wim_path, volume_token)?;
+    let ramdisk_device = format!("ramdisk=[{volume_token}]{ramdisk_wim_path},{ramdisk_options_id}");
+    let partition_device = format!("partition={volume_token}");
+
+    set_bcd_value(&ramdisk_options_id, "ramdisksdidevice", &partition_device)?;
+    set_bcd_value(&ramdisk_options_id, "ramdisksdipath", &ramdisk_sdi_path)?;
+
+    set_bcd_value(&entry_id, "device", &ramdisk_device)?;
+    set_bcd_value(&entry_id, "osdevice", &ramdisk_device)?;
+    set_bcd_value(&entry_id, "path", r"\Windows\System32\winload.efi")?;
+    set_bcd_value(&entry_id, "systemroot", r"\Windows")?;
+    set_bcd_value(&entry_id, "winpe", "yes")?;
+    set_bcd_value(&entry_id, "detecthal", "yes")?;
+    set_bcd_value(&entry_id, "nx", "OptIn")?;
+
+    add_bcd_display_order(&entry_id)?;
+
+    Ok(BootEntryRegistration {
+        entry_id,
+        ramdisk_options_id,
+        display_name: display_name.to_string(),
+    })
+}
+
+#[cfg(not(windows))]
+fn register_winpe_boot_entry_impl(
+    _staging: &WinPeStaging,
+    _display_name: &str,
+) -> AppResult<BootEntryRegistration> {
+    Err(AppError::new(
+        AppErrorKind::UnsupportedEnvironment,
+        "PartBooter WinPE boot entry registration only runs on Windows hosts",
+    ))
+}
+
+#[cfg(windows)]
+fn verify_boot_entry_impl(entry_id: &str) -> AppResult<bool> {
+    let output = Command::new("bcdedit").args(["/enum", entry_id]).output()?;
+    Ok(output.status.success())
+}
+
+#[cfg(not(windows))]
+fn verify_boot_entry_impl(_entry_id: &str) -> AppResult<bool> {
+    Err(AppError::new(
+        AppErrorKind::UnsupportedEnvironment,
+        "PartBooter BCD verification only runs on Windows hosts",
+    ))
+}
+
+#[cfg(windows)]
+fn remove_boot_entry_impl(entry_id: &str, ramdisk_options_id: &str) -> AppResult<()> {
+    run_bcdedit_status(["/delete", entry_id], "delete managed WinPE boot entry")?;
+    run_bcdedit_status(
+        ["/delete", ramdisk_options_id],
+        "delete managed ramdisk options entry",
+    )?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_boot_entry_impl(_entry_id: &str, _ramdisk_options_id: &str) -> AppResult<()> {
+    Err(AppError::new(
+        AppErrorKind::UnsupportedEnvironment,
+        "PartBooter BCD rollback only runs on Windows hosts",
+    ))
+}
+
+#[cfg(windows)]
+fn remove_staged_payload_impl(stage_root: &Path) -> AppResult<()> {
+    if stage_root.exists() {
+        fs::remove_dir_all(stage_root).map_err(|error| {
+            AppError::new(
+                AppErrorKind::Io,
+                format!(
+                    "failed to remove staged WinPE payload at {}: {error}",
+                    stage_root.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_staged_payload_impl(_stage_root: &Path) -> AppResult<()> {
+    Err(AppError::new(
+        AppErrorKind::UnsupportedEnvironment,
+        "PartBooter staged-payload cleanup only runs on Windows hosts",
+    ))
+}
+
+#[cfg(windows)]
 fn is_usable_mount_point(path: &str) -> bool {
     let trimmed = path.trim();
     trimmed.len() >= 3 && trimmed.as_bytes().get(1) == Some(&b':')
+}
+
+#[cfg(windows)]
+fn normalize_volume_root(volume: &str) -> AppResult<PathBuf> {
+    let token = normalized_volume_token(volume)?;
+    Ok(PathBuf::from(format!("{token}\\")))
+}
+
+#[cfg(windows)]
+fn normalized_volume_token(volume: &str) -> AppResult<String> {
+    let trimmed = volume.trim().trim_end_matches(['\\', '/']);
+    if trimmed.len() == 2 && trimmed.as_bytes().get(1) == Some(&b':') {
+        Ok(trimmed.to_string())
+    } else {
+        Err(AppError::new(
+            AppErrorKind::Validation,
+            format!("invalid target volume; expected a drive root like D:, got {volume}"),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn locate_boot_sdi_source() -> AppResult<PathBuf> {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let candidates = [
+        PathBuf::from(format!(r"{windir}\Boot\DVD\EFI\boot.sdi")),
+        PathBuf::from(format!(r"{windir}\Boot\DVD\PCAT\boot.sdi")),
+        PathBuf::from(format!(r"{windir}\Boot\PXE\boot.sdi")),
+        PathBuf::from(format!(r"{windir}\System32\Recovery\boot.sdi")),
+    ];
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(AppError::new(
+        AppErrorKind::Io,
+        "unable to locate boot.sdi on the host; checked common Windows boot paths",
+    ))
+}
+
+#[cfg(windows)]
+fn create_bcd_object(description: &str, application: &str) -> AppResult<String> {
+    let output = Command::new("bcdedit")
+        .args(["/create", "/d", description, "/application", application])
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::new(
+            AppErrorKind::Io,
+            format!(
+                "bcdedit /create for {description} failed with exit status {}",
+                output.status
+            ),
+        ));
+    }
+    parse_guid_from_bcd_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(windows)]
+fn create_device_options_object(description: &str) -> AppResult<String> {
+    let output = Command::new("bcdedit")
+        .args(["/create", "/d", description, "/device"])
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::new(
+            AppErrorKind::Io,
+            format!(
+                "bcdedit /create /device for {description} failed with exit status {}",
+                output.status
+            ),
+        ));
+    }
+    parse_guid_from_bcd_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(windows)]
+fn set_bcd_value(entry_id: &str, key: &str, value: &str) -> AppResult<()> {
+    run_bcdedit_status(
+        ["/set", entry_id, key, value],
+        &format!("set {key} on {entry_id}"),
+    )
+}
+
+#[cfg(windows)]
+fn add_bcd_display_order(entry_id: &str) -> AppResult<()> {
+    run_bcdedit_status(
+        ["/displayorder", entry_id, "/addlast"],
+        &format!("add {entry_id} to display order"),
+    )
+}
+
+#[cfg(windows)]
+fn run_bcdedit_status<const N: usize>(args: [&str; N], action: &str) -> AppResult<()> {
+    let status = Command::new("bcdedit").args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            AppErrorKind::Io,
+            format!("bcdedit failed to {action} with exit status {status}"),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn parse_guid_from_bcd_output(output: &str) -> AppResult<String> {
+    let start = output.find('{').ok_or_else(|| {
+        AppError::new(
+            AppErrorKind::Validation,
+            "could not find a GUID in bcdedit output",
+        )
+    })?;
+    let end = output[start..].find('}').ok_or_else(|| {
+        AppError::new(
+            AppErrorKind::Validation,
+            "could not find the end of the GUID in bcdedit output",
+        )
+    })?;
+    Ok(output[start..=start + end].trim().to_string())
+}
+
+#[cfg(windows)]
+fn windows_volume_relative_path(path: &Path, volume_token: &str) -> AppResult<String> {
+    let path_str = path.display().to_string();
+    let prefix = format!("{volume_token}\\");
+    if let Some(relative) = path_str.strip_prefix(&prefix) {
+        Ok(format!("\\{}", relative.replace('/', "\\")))
+    } else {
+        Err(AppError::new(
+            AppErrorKind::Validation,
+            format!(
+                "path {} is not rooted under the expected target volume {}",
+                path.display(),
+                volume_token
+            ),
+        ))
+    }
 }
 
 #[cfg(windows)]

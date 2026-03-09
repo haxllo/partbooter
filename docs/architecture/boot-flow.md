@@ -4,7 +4,8 @@
 
 - v1 is `UEFI + GPT` only
 - existing ESP only
-- all PartBooter-managed artifacts live under `EFI/PartBooter`
+- ESP-managed artifacts live under PartBooter-managed backup roots
+- WinPE staged payloads live under the target volume at `\PartBooter\Operations\<operation-id>\WinPE`
 - all boot entry changes are additive
 - verification must complete before the operation is reported as successful
 
@@ -41,9 +42,10 @@
 1. Detect WIM-based WinPE input
 2. Reject raw Windows installer flows for v1 apply
 3. Back up managed state before staging
-4. Stage the WinPE-backed artifacts in the managed location
-5. Register a managed additive Windows boot entry
-6. Verify the entry and staged files
+4. Stage `boot.wim` and `boot.sdi` under the operation-specific managed directory
+5. Write the managed loader specification for the staged WinPE path
+6. Register a managed additive Windows boot entry
+7. Verify the entry and staged files
 
 ### Blocked behavior
 
@@ -54,4 +56,3 @@
 
 Rollback restores the managed PartBooter state and managed entry references. It
 does not attempt to rewrite the machine into a new default boot configuration.
-

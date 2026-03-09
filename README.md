@@ -41,12 +41,17 @@ Non-Windows hosts fail fast because live probing is Windows-only.
 - exports the current Windows BCD store
 - records a manifest and saved plan artifact for later verification
 
-The remaining boot-path steps are still pending:
+For supported `WinPE` payloads, `apply` also performs the first real boot path:
 
-- payload staging into the managed ESP area
-- loader config generation
-- additive boot-entry registration
-- live boot-entry verification
+- stages `boot.wim` and `boot.sdi` under the target volume
+- writes a managed loader specification for the operation
+- registers an additive BCD entry
+- verifies that the entry can be enumerated after registration
+
+The remaining boot-path steps are still pending for:
+
+- Linux ISO payload staging and registration
+- broader live recovery flows beyond managed entry removal
 
 ## Commands
 
@@ -63,8 +68,8 @@ partbooter repair --latest
 The helper binary mirrors the privileged lifecycle surface and is the future
 transport boundary for Windows elevation/service integration.
 
-`verify` now confirms the saved plan and backup artifacts for checkpointed
-operations. Full boot-entry mutation and recovery remain later milestones.
+`verify` now confirms checkpoint artifacts for all operations and validates the
+managed WinPE entry plus staged files for applied WinPE operations.
 
 ## Build
 

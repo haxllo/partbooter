@@ -10,7 +10,9 @@ use partbooter_common::{
 use partbooter_journal::FileJournalStore;
 use partbooter_payload_linux_iso as linux_iso;
 use partbooter_payload_winpe as winpe;
-use partbooter_windows::{BackupCheckpoint, WindowsApplyAdapter, WindowsProbeAdapter};
+use partbooter_windows::{
+    BackupCheckpoint, BootEntryRegistration, WinPeStaging, WindowsApplyAdapter, WindowsProbeAdapter,
+};
 
 #[derive(Debug, Clone)]
 enum ProbeSource {
@@ -224,22 +226,29 @@ impl PartBooterService {
             &checkpoint.notes,
         )?;
 
-        let steps = plan
-            .steps
-            .iter()
-            .map(|step| self.apply_step_record(step, &checkpoint))
-            .collect::<Vec<_>>();
+        let journal = match plan.payload.kind {
+            PayloadKind::WinPe => {
+                self.apply_winpe_plan(plan, &operation_id, &operation_root, &checkpoint)?
+            }
+            _ => {
+                let steps = plan
+                    .steps
+                    .iter()
+                    .map(|step| self.apply_checkpoint_step_record(step, &checkpoint))
+                    .collect::<Vec<_>>();
 
-        let journal = OperationJournal {
-            operation_id: operation_id.clone(),
-            plan_id: plan.plan_id.clone(),
-            backup_root: plan.backup_root.clone(),
-            status: OperationStatus::Checkpointed,
-            steps,
-            summary: format!(
-                "Created a protected backup checkpoint for {} on target volume {}; payload staging and boot registration remain pending.",
-                plan.payload.display_name, plan.target_volume
-            ),
+                OperationJournal {
+                    operation_id: operation_id.clone(),
+                    plan_id: plan.plan_id.clone(),
+                    backup_root: plan.backup_root.clone(),
+                    status: OperationStatus::Checkpointed,
+                    steps,
+                    summary: format!(
+                        "Created a protected backup checkpoint for {} on target volume {}; payload staging and boot registration remain pending.",
+                        plan.payload.display_name, plan.target_volume
+                    ),
+                }
+            }
         };
 
         self.journal_store.save_journal(&journal)?;
@@ -248,6 +257,7 @@ impl PartBooterService {
 
     pub fn verify_operation(&self, operation_id: &str) -> AppResult<VerificationReport> {
         let journal = self.journal_store.load_journal(operation_id)?;
+        let operation_root = self.journal_store.operation_dir(operation_id);
         let backup_root = PathBuf::from(&journal.backup_root);
         let backup_artifacts_present = backup_root.join("manifest.txt").exists()
             && backup_root.join("esp").exists()
@@ -256,17 +266,37 @@ impl PartBooterService {
             .journal_store
             .operation_plan_path(operation_id)
             .exists();
-        let boot_entry_registered = journal.status == OperationStatus::Applied
-            || journal.status == OperationStatus::Verified;
-        let staged_artifacts_present = journal.status == OperationStatus::Applied
-            || journal.status == OperationStatus::Verified;
+        let winpe_metadata = self.read_winpe_operation_metadata(&operation_root)?;
+        let staged_artifacts_present = if let Some(metadata) = &winpe_metadata {
+            metadata.boot_wim_path.exists()
+                && metadata.boot_sdi_path.exists()
+                && metadata.loader_spec_path.exists()
+        } else {
+            journal.status == OperationStatus::Applied
+                || journal.status == OperationStatus::Verified
+        };
+        let boot_entry_registered = if let Some(metadata) = &winpe_metadata {
+            self.verify_registered_entry(&metadata.entry_id)?
+        } else {
+            journal.status == OperationStatus::Applied
+                || journal.status == OperationStatus::Verified
+        };
 
         let mut warnings = Vec::new();
+        let full_boot_path_expected = winpe_metadata.is_some()
+            || journal.status == OperationStatus::Applied
+            || journal.status == OperationStatus::Verified;
         if journal.status == OperationStatus::Checkpointed {
             warnings.push(
                 "Operation is checkpointed only; payload staging and boot entry registration are not implemented in this milestone."
                     .to_string(),
             );
+        }
+        if journal.status == OperationStatus::Applied && !staged_artifacts_present {
+            warnings.push("Managed WinPE staging artifacts are incomplete or missing.".to_string());
+        }
+        if journal.status == OperationStatus::Applied && !boot_entry_registered {
+            warnings.push("Managed BCD entry is missing or no longer registered.".to_string());
         }
         if !backup_artifacts_present {
             warnings.push("Backup artifacts are incomplete or missing.".to_string());
@@ -282,12 +312,25 @@ impl PartBooterService {
             boot_entry_registered,
             staged_artifacts_present,
             warnings,
-            verified: backup_artifacts_present && operation_plan_present,
+            verified: if full_boot_path_expected {
+                backup_artifacts_present
+                    && operation_plan_present
+                    && staged_artifacts_present
+                    && boot_entry_registered
+            } else {
+                backup_artifacts_present && operation_plan_present
+            },
         })
     }
 
     pub fn rollback_operation(&self, operation_id: &str) -> AppResult<OperationJournal> {
         let mut journal = self.journal_store.load_journal(operation_id)?;
+        let operation_root = self.journal_store.operation_dir(operation_id);
+        if let Some(metadata) = self.read_winpe_operation_metadata(&operation_root)? {
+            self.remove_registered_entry(&metadata.entry_id, &metadata.ramdisk_options_id)?;
+            self.remove_staged_payload(&metadata.stage_root)?;
+            self.remove_winpe_operation_metadata(&operation_root)?;
+        }
         journal.status = OperationStatus::RolledBack;
         journal.summary = format!(
             "Rolled back operation {} using recorded backup state.",
@@ -357,7 +400,7 @@ impl PartBooterService {
         Ok(())
     }
 
-    fn apply_step_record(
+    fn apply_checkpoint_step_record(
         &self,
         step: &PlanStep,
         checkpoint: &BackupCheckpoint,
@@ -392,6 +435,117 @@ impl PartBooterService {
         }
     }
 
+    fn apply_winpe_plan(
+        &self,
+        plan: &ExecutionPlan,
+        operation_id: &str,
+        operation_root: &Path,
+        checkpoint: &BackupCheckpoint,
+    ) -> AppResult<OperationJournal> {
+        let staging = self.stage_winpe_payload(
+            &plan.payload.source_path,
+            &plan.target_volume,
+            operation_id,
+            operation_root,
+        )?;
+        let registration = self.register_winpe_entry(&staging, &plan.payload.display_name)?;
+        let loader_spec_path = self.write_winpe_loader_spec(
+            operation_root,
+            &staging,
+            &registration,
+            &plan.payload.display_name,
+        )?;
+        self.write_winpe_operation_metadata(
+            operation_root,
+            &staging,
+            &registration,
+            &loader_spec_path,
+        )?;
+        if !self.verify_registered_entry(&registration.entry_id)? {
+            return Err(AppError::new(
+                AppErrorKind::Verification,
+                format!(
+                    "managed WinPE BCD entry {} could not be verified after registration",
+                    registration.entry_id
+                ),
+            ));
+        }
+
+        let steps = plan
+            .steps
+            .iter()
+            .map(|step| {
+                self.apply_winpe_step_record(
+                    step,
+                    checkpoint,
+                    &staging,
+                    &registration,
+                    &loader_spec_path,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        Ok(OperationJournal {
+            operation_id: operation_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            backup_root: plan.backup_root.clone(),
+            status: OperationStatus::Applied,
+            steps,
+            summary: format!(
+                "Applied WinPE staging and additive boot entry for {} on target volume {}.",
+                plan.payload.display_name, plan.target_volume
+            ),
+        })
+    }
+
+    fn apply_winpe_step_record(
+        &self,
+        step: &PlanStep,
+        checkpoint: &BackupCheckpoint,
+        staging: &WinPeStaging,
+        registration: &BootEntryRegistration,
+        loader_spec_path: &Path,
+    ) -> OperationStepRecord {
+        match step.kind {
+            PlanStepKind::BackupEsp | PlanStepKind::SnapshotBootConfig => {
+                self.apply_checkpoint_step_record(step, checkpoint)
+            }
+            PlanStepKind::StagePayload => OperationStepRecord {
+                step_id: step.id,
+                kind: step.kind.clone(),
+                outcome: ActionOutcome::Completed,
+                detail: format!(
+                    "Staged WinPE artifacts into {}.",
+                    staging.stage_root.display()
+                ),
+            },
+            PlanStepKind::WriteLoaderConfig => OperationStepRecord {
+                step_id: step.id,
+                kind: step.kind.clone(),
+                outcome: ActionOutcome::Completed,
+                detail: format!(
+                    "Wrote WinPE loader settings to {}.",
+                    loader_spec_path.display()
+                ),
+            },
+            PlanStepKind::RegisterBootEntry => OperationStepRecord {
+                step_id: step.id,
+                kind: step.kind.clone(),
+                outcome: ActionOutcome::Completed,
+                detail: format!(
+                    "Registered additive WinPE boot entry {} ({})",
+                    registration.entry_id, registration.display_name
+                ),
+            },
+            PlanStepKind::VerifyBootEntry => OperationStepRecord {
+                step_id: step.id,
+                kind: step.kind.clone(),
+                outcome: ActionOutcome::Completed,
+                detail: "Verified managed WinPE files and BCD entry registration.".to_string(),
+            },
+        }
+    }
+
     fn create_backup_checkpoint(
         &self,
         probe: &partbooter_common::MachineProbe,
@@ -404,6 +558,183 @@ impl PartBooterService {
             #[cfg(test)]
             ProbeSource::Fixture(_) => self.create_fixture_backup_checkpoint(backup_root),
         }
+    }
+
+    fn stage_winpe_payload(
+        &self,
+        source_path: &str,
+        target_volume: &str,
+        operation_id: &str,
+        _operation_root: &Path,
+    ) -> AppResult<WinPeStaging> {
+        match &self.probe_source {
+            ProbeSource::Live => {
+                WindowsApplyAdapter::stage_winpe_payload(source_path, target_volume, operation_id)
+            }
+            #[cfg(test)]
+            ProbeSource::Fixture(_) => {
+                self.create_fixture_winpe_staging(source_path, _operation_root)
+            }
+        }
+    }
+
+    fn register_winpe_entry(
+        &self,
+        staging: &WinPeStaging,
+        display_name: &str,
+    ) -> AppResult<BootEntryRegistration> {
+        match &self.probe_source {
+            ProbeSource::Live => WindowsApplyAdapter::register_winpe_boot_entry(
+                staging,
+                &format!("PartBooter {display_name}"),
+            ),
+            #[cfg(test)]
+            ProbeSource::Fixture(_) => Ok(self.fixture_winpe_registration(display_name)),
+        }
+    }
+
+    fn verify_registered_entry(&self, entry_id: &str) -> AppResult<bool> {
+        match &self.probe_source {
+            ProbeSource::Live => WindowsApplyAdapter::verify_boot_entry(entry_id),
+            #[cfg(test)]
+            ProbeSource::Fixture(_) => Ok(true),
+        }
+    }
+
+    fn remove_registered_entry(&self, entry_id: &str, ramdisk_options_id: &str) -> AppResult<()> {
+        match &self.probe_source {
+            ProbeSource::Live => {
+                WindowsApplyAdapter::remove_boot_entry(entry_id, ramdisk_options_id)
+            }
+            #[cfg(test)]
+            ProbeSource::Fixture(_) => Ok(()),
+        }
+    }
+
+    fn remove_staged_payload(&self, stage_root: &Path) -> AppResult<()> {
+        match &self.probe_source {
+            ProbeSource::Live => WindowsApplyAdapter::remove_staged_payload(stage_root),
+            #[cfg(test)]
+            ProbeSource::Fixture(_) => {
+                if stage_root.exists() {
+                    fs::remove_dir_all(stage_root)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn write_winpe_loader_spec(
+        &self,
+        operation_root: &Path,
+        staging: &WinPeStaging,
+        registration: &BootEntryRegistration,
+        display_name: &str,
+    ) -> AppResult<PathBuf> {
+        let path = operation_root.join("loader-spec.txt");
+        let contents = [
+            "PARTBOOTER_WINPE_LOADER_V1".to_string(),
+            format!("display_name={display_name}"),
+            format!("entry_id={}", registration.entry_id),
+            format!("ramdisk_options_id={}", registration.ramdisk_options_id),
+            format!("target_volume={}", staging.target_volume),
+            format!("boot_wim_path={}", staging.boot_wim_path.display()),
+            format!("boot_sdi_path={}", staging.boot_sdi_path.display()),
+            "path=\\Windows\\System32\\winload.efi".to_string(),
+            "systemroot=\\Windows".to_string(),
+            "winpe=yes".to_string(),
+            "detecthal=yes".to_string(),
+            "nx=OptIn".to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, contents)?;
+        Ok(path)
+    }
+
+    fn write_winpe_operation_metadata(
+        &self,
+        operation_root: &Path,
+        staging: &WinPeStaging,
+        registration: &BootEntryRegistration,
+        loader_spec_path: &Path,
+    ) -> AppResult<()> {
+        fs::write(operation_root.join("entry-id.txt"), &registration.entry_id)?;
+        fs::write(
+            operation_root.join("ramdisk-options-id.txt"),
+            &registration.ramdisk_options_id,
+        )?;
+        fs::write(
+            operation_root.join("staging-root.txt"),
+            staging.stage_root.display().to_string(),
+        )?;
+        fs::write(
+            operation_root.join("boot-wim-path.txt"),
+            staging.boot_wim_path.display().to_string(),
+        )?;
+        fs::write(
+            operation_root.join("boot-sdi-path.txt"),
+            staging.boot_sdi_path.display().to_string(),
+        )?;
+        fs::write(
+            operation_root.join("loader-spec-path.txt"),
+            loader_spec_path.display().to_string(),
+        )?;
+        Ok(())
+    }
+
+    fn read_winpe_operation_metadata(
+        &self,
+        operation_root: &Path,
+    ) -> AppResult<Option<WinPeOperationMetadata>> {
+        let entry_id_path = operation_root.join("entry-id.txt");
+        if !entry_id_path.exists() {
+            return Ok(None);
+        }
+
+        Ok(Some(WinPeOperationMetadata {
+            entry_id: fs::read_to_string(entry_id_path)?.trim().to_string(),
+            ramdisk_options_id: fs::read_to_string(operation_root.join("ramdisk-options-id.txt"))?
+                .trim()
+                .to_string(),
+            stage_root: PathBuf::from(
+                fs::read_to_string(operation_root.join("staging-root.txt"))?
+                    .trim()
+                    .to_string(),
+            ),
+            boot_wim_path: PathBuf::from(
+                fs::read_to_string(operation_root.join("boot-wim-path.txt"))?
+                    .trim()
+                    .to_string(),
+            ),
+            boot_sdi_path: PathBuf::from(
+                fs::read_to_string(operation_root.join("boot-sdi-path.txt"))?
+                    .trim()
+                    .to_string(),
+            ),
+            loader_spec_path: PathBuf::from(
+                fs::read_to_string(operation_root.join("loader-spec-path.txt"))?
+                    .trim()
+                    .to_string(),
+            ),
+        }))
+    }
+
+    fn remove_winpe_operation_metadata(&self, operation_root: &Path) -> AppResult<()> {
+        for file_name in [
+            "entry-id.txt",
+            "ramdisk-options-id.txt",
+            "staging-root.txt",
+            "boot-wim-path.txt",
+            "boot-sdi-path.txt",
+            "loader-spec-path.txt",
+            "loader-spec.txt",
+        ] {
+            let path = operation_root.join(file_name);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -421,6 +752,45 @@ impl PartBooterService {
             notes: vec!["Fixture checkpoint created for tests.".to_string()],
         })
     }
+
+    #[cfg(test)]
+    fn create_fixture_winpe_staging(
+        &self,
+        source_path: &str,
+        operation_root: &Path,
+    ) -> AppResult<WinPeStaging> {
+        let stage_root = operation_root.join("fixture-winpe");
+        fs::create_dir_all(&stage_root)?;
+        let boot_wim_path = stage_root.join("boot.wim");
+        fs::write(&boot_wim_path, format!("fixture-winpe-from={source_path}"))?;
+        let boot_sdi_path = stage_root.join("boot.sdi");
+        fs::write(&boot_sdi_path, "fixture-boot-sdi")?;
+
+        Ok(WinPeStaging {
+            stage_root,
+            boot_wim_path,
+            boot_sdi_path,
+            target_volume: "D:".to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    fn fixture_winpe_registration(&self, display_name: &str) -> BootEntryRegistration {
+        BootEntryRegistration {
+            entry_id: "{11111111-1111-1111-1111-111111111111}".to_string(),
+            ramdisk_options_id: "{22222222-2222-2222-2222-222222222222}".to_string(),
+            display_name: format!("PartBooter {display_name}"),
+        }
+    }
+}
+
+struct WinPeOperationMetadata {
+    entry_id: String,
+    ramdisk_options_id: String,
+    stage_root: PathBuf,
+    boot_wim_path: PathBuf,
+    boot_sdi_path: PathBuf,
+    loader_spec_path: PathBuf,
 }
 
 fn unique_suffix() -> String {
@@ -499,10 +869,11 @@ mod tests {
             .build_plan("C:\\images\\winpe_boot.wim", "D:")
             .expect("plan should succeed");
         let journal = service.apply_plan(&plan).expect("apply should succeed");
-        assert_eq!(journal.status, OperationStatus::Checkpointed);
+        assert_eq!(journal.status, OperationStatus::Applied);
         assert_eq!(journal.steps[0].outcome, ActionOutcome::Completed);
         assert_eq!(journal.steps[1].kind, PlanStepKind::SnapshotBootConfig);
-        assert_eq!(journal.steps[2].outcome, ActionOutcome::Skipped);
+        assert_eq!(journal.steps[2].outcome, ActionOutcome::Completed);
+        assert_eq!(journal.steps[4].outcome, ActionOutcome::Completed);
 
         let report = service
             .verify_operation(&journal.operation_id)
@@ -510,7 +881,27 @@ mod tests {
         assert!(report.verified);
         assert!(report.backup_artifacts_present);
         assert!(report.operation_plan_present);
-        assert!(!report.boot_entry_registered);
+        assert!(report.boot_entry_registered);
+        assert!(report.staged_artifacts_present);
+    }
+
+    #[test]
+    fn rolls_back_applied_winpe_operation() {
+        let service = PartBooterService::with_probe_fixture(temp_root(), supported_probe_fixture());
+        let plan = service
+            .build_plan("C:\\images\\winpe_boot.wim", "D:")
+            .expect("plan should succeed");
+        let journal = service.apply_plan(&plan).expect("apply should succeed");
+
+        let rolled_back = service
+            .rollback_operation(&journal.operation_id)
+            .expect("rollback should succeed");
+        assert_eq!(rolled_back.status, OperationStatus::RolledBack);
+
+        let report = service
+            .verify_operation(&journal.operation_id)
+            .expect("verify should still succeed");
+        assert!(!report.staged_artifacts_present);
     }
 
     #[test]
