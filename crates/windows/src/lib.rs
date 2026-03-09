@@ -451,7 +451,9 @@ fn missing_field(name: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowsProbeAdapter, parse_probe_output, robocopy_succeeded};
+    #[cfg(not(windows))]
+    use super::WindowsProbeAdapter;
+    use super::{parse_probe_output, robocopy_succeeded};
     use partbooter_common::{FirmwareMode, PartitionStyle};
 
     #[test]
