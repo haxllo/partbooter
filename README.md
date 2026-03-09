@@ -33,6 +33,21 @@ PowerShell/Storage cmdlets when run on Windows. It collects:
 
 Non-Windows hosts fail fast because live probing is Windows-only.
 
+## Apply behavior
+
+`partbooter apply` now performs a real checkpoint phase:
+
+- backs up the EFI System Partition into the operation backup root
+- exports the current Windows BCD store
+- records a manifest and saved plan artifact for later verification
+
+The remaining boot-path steps are still pending:
+
+- payload staging into the managed ESP area
+- loader config generation
+- additive boot-entry registration
+- live boot-entry verification
+
 ## Commands
 
 ```text
@@ -48,8 +63,8 @@ partbooter repair --latest
 The helper binary mirrors the privileged lifecycle surface and is the future
 transport boundary for Windows elevation/service integration.
 
-`apply`, `verify`, `rollback`, and `repair` still operate as scaffolded journal
-and plan lifecycle commands. Real ESP/BCD mutation remains a later milestone.
+`verify` now confirms the saved plan and backup artifacts for checkpointed
+operations. Full boot-entry mutation and recovery remain later milestones.
 
 ## Build
 

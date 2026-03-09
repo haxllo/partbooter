@@ -54,6 +54,7 @@ pub enum ActionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationStatus {
     Planned,
+    Checkpointed,
     Applied,
     Verified,
     RolledBack,
@@ -145,6 +146,8 @@ pub struct OperationJournal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
     pub operation_id: String,
+    pub backup_artifacts_present: bool,
+    pub operation_plan_present: bool,
     pub boot_entry_registered: bool,
     pub staged_artifacts_present: bool,
     pub warnings: Vec<String>,
@@ -266,6 +269,7 @@ impl OperationStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Planned => "planned",
+            Self::Checkpointed => "checkpointed",
             Self::Applied => "applied",
             Self::Verified => "verified",
             Self::RolledBack => "rolled-back",
@@ -277,6 +281,7 @@ impl OperationStatus {
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "planned" => Some(Self::Planned),
+            "checkpointed" => Some(Self::Checkpointed),
             "applied" => Some(Self::Applied),
             "verified" => Some(Self::Verified),
             "rolled-back" => Some(Self::RolledBack),
@@ -712,6 +717,14 @@ impl VerificationReport {
     pub fn to_json(&self) -> String {
         json::object(&[
             ("operationId", json::string(&self.operation_id)),
+            (
+                "backupArtifactsPresent",
+                json::bool_value(self.backup_artifacts_present).to_string(),
+            ),
+            (
+                "operationPlanPresent",
+                json::bool_value(self.operation_plan_present).to_string(),
+            ),
             (
                 "bootEntryRegistered",
                 json::bool_value(self.boot_entry_registered).to_string(),

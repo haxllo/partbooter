@@ -1,11 +1,12 @@
 #[cfg(windows)]
+use std::fs;
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 
-use partbooter_common::{
-    AppError, AppErrorKind, AppResult, MachineProbe,
-};
+use partbooter_common::{AppError, AppErrorKind, AppResult, EspInfo, MachineProbe};
 #[cfg(any(windows, test))]
-use partbooter_common::{EspInfo, FirmwareMode, HostPlatform, PartitionStyle};
+use partbooter_common::{FirmwareMode, HostPlatform, PartitionStyle};
 
 #[cfg(windows)]
 const PROBE_SCRIPT: &str = r#"
@@ -129,6 +130,24 @@ impl WindowsProbeAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BackupCheckpoint {
+    pub esp_backup_dir: PathBuf,
+    pub bcd_store_path: PathBuf,
+    pub notes: Vec<String>,
+}
+
+pub struct WindowsApplyAdapter;
+
+impl WindowsApplyAdapter {
+    pub fn create_backup_checkpoint(
+        esp: &EspInfo,
+        backup_root: impl AsRef<Path>,
+    ) -> AppResult<BackupCheckpoint> {
+        create_backup_checkpoint_impl(esp, backup_root.as_ref())
+    }
+}
+
 #[cfg(windows)]
 fn probe_impl() -> AppResult<MachineProbe> {
     let output = Command::new("powershell.exe")
@@ -166,6 +185,150 @@ fn probe_impl() -> AppResult<MachineProbe> {
         AppErrorKind::UnsupportedEnvironment,
         "PartBooter live probing only runs on Windows hosts",
     ))
+}
+
+#[cfg(windows)]
+fn create_backup_checkpoint_impl(esp: &EspInfo, backup_root: &Path) -> AppResult<BackupCheckpoint> {
+    fs::create_dir_all(backup_root)?;
+
+    let esp_backup_dir = backup_root.join("esp");
+    fs::create_dir_all(&esp_backup_dir)?;
+    let bcd_store_path = backup_root.join("bcd-store.bak");
+
+    let mut mounted_drive = None;
+    let esp_source = if is_usable_mount_point(&esp.mount_point) {
+        normalize_root_path(&esp.mount_point)
+    } else {
+        let drive_letter = find_free_drive_letter()?;
+        mount_esp_to_letter(drive_letter)?;
+        let mounted = format!("{drive_letter}:\\");
+        mounted_drive = Some(mounted.clone());
+        PathBuf::from(mounted)
+    };
+
+    let robocopy_code = Command::new("robocopy")
+        .arg(&esp_source)
+        .arg(&esp_backup_dir)
+        .args([
+            "/E",
+            "/COPY:DAT",
+            "/R:1",
+            "/W:1",
+            "/NFL",
+            "/NDL",
+            "/NJH",
+            "/NJS",
+            "/NP",
+        ])
+        .status()?
+        .code()
+        .unwrap_or(16);
+
+    if let Some(drive) = mounted_drive {
+        let _ = unmount_esp_from_letter(&drive);
+    }
+
+    if !robocopy_succeeded(robocopy_code) {
+        return Err(AppError::new(
+            AppErrorKind::Io,
+            format!("robocopy failed while backing up the ESP with exit code {robocopy_code}"),
+        ));
+    }
+
+    let bcd_status = Command::new("bcdedit")
+        .args(["/export", &bcd_store_path.display().to_string()])
+        .status()?;
+    if !bcd_status.success() {
+        return Err(AppError::new(
+            AppErrorKind::Io,
+            format!("bcdedit /export failed with exit status {bcd_status}"),
+        ));
+    }
+
+    Ok(BackupCheckpoint {
+        esp_backup_dir,
+        bcd_store_path,
+        notes: vec![
+            "ESP backup created with robocopy.".to_string(),
+            "BCD snapshot exported with bcdedit.".to_string(),
+        ],
+    })
+}
+
+#[cfg(not(windows))]
+fn create_backup_checkpoint_impl(
+    _esp: &EspInfo,
+    _backup_root: &Path,
+) -> AppResult<BackupCheckpoint> {
+    Err(AppError::new(
+        AppErrorKind::UnsupportedEnvironment,
+        "PartBooter backup checkpointing only runs on Windows hosts",
+    ))
+}
+
+#[cfg(windows)]
+fn is_usable_mount_point(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed.len() >= 3 && trimmed.as_bytes().get(1) == Some(&b':')
+}
+
+#[cfg(windows)]
+fn normalize_root_path(path: &str) -> PathBuf {
+    if path.ends_with('\\') || path.ends_with('/') {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(format!("{path}\\"))
+    }
+}
+
+#[cfg(windows)]
+fn find_free_drive_letter() -> AppResult<char> {
+    for letter in ('T'..='Z').rev() {
+        let candidate = format!("{letter}:\\");
+        if !Path::new(&candidate).exists() {
+            return Ok(letter);
+        }
+    }
+
+    Err(AppError::new(
+        AppErrorKind::Io,
+        "unable to find a temporary drive letter for mounting the ESP",
+    ))
+}
+
+#[cfg(windows)]
+fn mount_esp_to_letter(letter: char) -> AppResult<()> {
+    let mount_target = format!("{letter}:");
+    let status = Command::new("mountvol")
+        .args([&mount_target, "/s"])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            AppErrorKind::Io,
+            format!("mountvol {mount_target} /s failed with exit status {status}"),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn unmount_esp_from_letter(drive: &str) -> AppResult<()> {
+    let target = drive.trim_end_matches('\\');
+    let status = Command::new("mountvol").args([target, "/d"]).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            AppErrorKind::Io,
+            format!("mountvol {target} /d failed with exit status {status}"),
+        ))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn robocopy_succeeded(code: i32) -> bool {
+    (0..=7).contains(&code)
 }
 
 #[cfg(any(windows, test))]
@@ -288,7 +451,7 @@ fn missing_field(name: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowsProbeAdapter, parse_probe_output};
+    use super::{WindowsProbeAdapter, parse_probe_output, robocopy_succeeded};
     use partbooter_common::{FirmwareMode, PartitionStyle};
 
     #[test]
@@ -323,5 +486,12 @@ mod tests {
     fn live_probe_fails_on_non_windows_hosts() {
         let error = WindowsProbeAdapter::probe().expect_err("non-Windows hosts should fail");
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn robocopy_exit_code_rules_match_windows_convention() {
+        assert!(robocopy_succeeded(0));
+        assert!(robocopy_succeeded(7));
+        assert!(!robocopy_succeeded(8));
     }
 }

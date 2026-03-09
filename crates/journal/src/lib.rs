@@ -23,20 +23,29 @@ impl FileJournalStore {
         Ok(())
     }
 
-    pub fn write_backup_manifest(&self, plan: &ExecutionPlan) -> AppResult<PathBuf> {
+    pub fn write_backup_manifest(
+        &self,
+        plan: &ExecutionPlan,
+        esp_backup_dir: &Path,
+        bcd_store_path: &Path,
+        notes: &[String],
+    ) -> AppResult<PathBuf> {
         let backup_root = self.backups_dir().join(&plan.plan_id);
         fs::create_dir_all(&backup_root)?;
 
         let manifest_path = backup_root.join("manifest.txt");
-        let manifest = [
+        let mut lines = vec![
             "PARTBOOTER_BACKUP_MANIFEST_V1".to_string(),
             format!("plan_id={}", plan.plan_id),
             format!("payload={}", plan.payload.source_path),
             format!("target_volume={}", plan.target_volume),
-            "notes=Scaffold manifest; real backup inventory lands in the next milestone."
-                .to_string(),
-        ]
-        .join("\n");
+            format!("esp_backup_dir={}", esp_backup_dir.display()),
+            format!("bcd_store_path={}", bcd_store_path.display()),
+        ];
+        for note in notes {
+            lines.push(format!("note={note}"));
+        }
+        let manifest = lines.join("\n");
         fs::write(&manifest_path, manifest)?;
         Ok(manifest_path)
     }
@@ -54,6 +63,18 @@ impl FileJournalStore {
         let path = self.operations_dir().join(format!("{operation_id}.pbop"));
         let content = fs::read_to_string(path)?;
         OperationJournal::from_record_file(&content)
+    }
+
+    pub fn operation_dir(&self, operation_id: &str) -> PathBuf {
+        self.operations_dir().join(operation_id)
+    }
+
+    pub fn operation_plan_path(&self, operation_id: &str) -> PathBuf {
+        self.operation_dir(operation_id).join("plan.pbplan")
+    }
+
+    pub fn backup_root_for_plan(&self, plan_id: &str) -> PathBuf {
+        self.backups_dir().join(plan_id)
     }
 
     pub fn latest_operation_id(&self) -> AppResult<String> {

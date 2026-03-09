@@ -31,7 +31,7 @@ Action:
 Symptoms:
 
 - helper stopped mid-run
-- staged files exist but verification did not complete
+- checkpoint artifacts exist but later steps did not complete
 
 Action:
 
@@ -43,8 +43,8 @@ Action:
 Symptoms:
 
 - managed entry missing
-- staged artifacts incomplete
-- managed directory does not match expectations
+- backup manifest or BCD snapshot missing
+- staged artifacts incomplete in later milestones
 
 Action:
 
@@ -56,4 +56,3 @@ Action:
 - never delete the existing default Windows path as part of recovery
 - prefer restoring the managed subset over broad boot reconfiguration
 - keep all recovery decisions tied to a known operation identifier
-

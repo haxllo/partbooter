@@ -10,7 +10,7 @@ use partbooter_common::{
 use partbooter_journal::FileJournalStore;
 use partbooter_payload_linux_iso as linux_iso;
 use partbooter_payload_winpe as winpe;
-use partbooter_windows::WindowsProbeAdapter;
+use partbooter_windows::{BackupCheckpoint, WindowsApplyAdapter, WindowsProbeAdapter};
 
 #[derive(Debug, Clone)]
 enum ProbeSource {
@@ -205,38 +205,39 @@ impl PartBooterService {
     }
 
     pub fn apply_plan(&self, plan: &ExecutionPlan) -> AppResult<OperationJournal> {
+        let probe = self.probe_machine()?;
+        self.validate_probe(&probe)?;
         self.validate_payload(&plan.payload)?;
         self.journal_store.ensure_layout()?;
-        self.journal_store.write_backup_manifest(plan)?;
 
         let operation_id = format!("op-{}", unique_suffix());
-        let operation_root = self
-            .journal_store
-            .root()
-            .join("operations")
-            .join(&operation_id);
+        let operation_root = self.journal_store.operation_dir(&operation_id);
         fs::create_dir_all(&operation_root)?;
         fs::write(operation_root.join("plan.pbplan"), plan.to_plan_file())?;
+
+        let backup_root = self.journal_store.backup_root_for_plan(&plan.plan_id);
+        let checkpoint = self.create_backup_checkpoint(&probe, &backup_root)?;
+        self.journal_store.write_backup_manifest(
+            plan,
+            &checkpoint.esp_backup_dir,
+            &checkpoint.bcd_store_path,
+            &checkpoint.notes,
+        )?;
 
         let steps = plan
             .steps
             .iter()
-            .map(|step| OperationStepRecord {
-                step_id: step.id,
-                kind: step.kind.clone(),
-                outcome: ActionOutcome::Completed,
-                detail: format!("Scaffold applied step {}: {}", step.id, step.description),
-            })
+            .map(|step| self.apply_step_record(step, &checkpoint))
             .collect::<Vec<_>>();
 
         let journal = OperationJournal {
             operation_id: operation_id.clone(),
             plan_id: plan.plan_id.clone(),
             backup_root: plan.backup_root.clone(),
-            status: OperationStatus::Applied,
+            status: OperationStatus::Checkpointed,
             steps,
             summary: format!(
-                "Applied the scaffold plan for {} on target volume {}.",
+                "Created a protected backup checkpoint for {} on target volume {}; payload staging and boot registration remain pending.",
                 plan.payload.display_name, plan.target_volume
             ),
         };
@@ -247,23 +248,41 @@ impl PartBooterService {
 
     pub fn verify_operation(&self, operation_id: &str) -> AppResult<VerificationReport> {
         let journal = self.journal_store.load_journal(operation_id)?;
-        let verified = journal.status == OperationStatus::Applied
+        let backup_root = PathBuf::from(&journal.backup_root);
+        let backup_artifacts_present = backup_root.join("manifest.txt").exists()
+            && backup_root.join("esp").exists()
+            && backup_root.join("bcd-store.bak").exists();
+        let operation_plan_present = self
+            .journal_store
+            .operation_plan_path(operation_id)
+            .exists();
+        let boot_entry_registered = journal.status == OperationStatus::Applied
             || journal.status == OperationStatus::Verified;
-        let warnings = if verified {
-            vec![
-                "Verification is currently file- and journal-based; live firmware validation is a future milestone."
+        let staged_artifacts_present = journal.status == OperationStatus::Applied
+            || journal.status == OperationStatus::Verified;
+
+        let mut warnings = Vec::new();
+        if journal.status == OperationStatus::Checkpointed {
+            warnings.push(
+                "Operation is checkpointed only; payload staging and boot entry registration are not implemented in this milestone."
                     .to_string(),
-            ]
-        } else {
-            vec!["Operation is not in an applied state.".to_string()]
-        };
+            );
+        }
+        if !backup_artifacts_present {
+            warnings.push("Backup artifacts are incomplete or missing.".to_string());
+        }
+        if !operation_plan_present {
+            warnings.push("Saved plan artifact is missing for the operation.".to_string());
+        }
 
         Ok(VerificationReport {
             operation_id: journal.operation_id,
-            boot_entry_registered: verified,
-            staged_artifacts_present: true,
+            backup_artifacts_present,
+            operation_plan_present,
+            boot_entry_registered,
+            staged_artifacts_present,
             warnings,
-            verified,
+            verified: backup_artifacts_present && operation_plan_present,
         })
     }
 
@@ -337,6 +356,71 @@ impl PartBooterService {
         }
         Ok(())
     }
+
+    fn apply_step_record(
+        &self,
+        step: &PlanStep,
+        checkpoint: &BackupCheckpoint,
+    ) -> OperationStepRecord {
+        match step.kind {
+            PlanStepKind::BackupEsp => OperationStepRecord {
+                step_id: step.id,
+                kind: step.kind.clone(),
+                outcome: ActionOutcome::Completed,
+                detail: format!(
+                    "Backed up the EFI System Partition to {}.",
+                    checkpoint.esp_backup_dir.display()
+                ),
+            },
+            PlanStepKind::SnapshotBootConfig => OperationStepRecord {
+                step_id: step.id,
+                kind: step.kind.clone(),
+                outcome: ActionOutcome::Completed,
+                detail: format!(
+                    "Exported the Windows boot configuration to {}.",
+                    checkpoint.bcd_store_path.display()
+                ),
+            },
+            _ => OperationStepRecord {
+                step_id: step.id,
+                kind: step.kind.clone(),
+                outcome: ActionOutcome::Skipped,
+                detail:
+                    "Execution beyond backup checkpointing is not implemented in this milestone."
+                        .to_string(),
+            },
+        }
+    }
+
+    fn create_backup_checkpoint(
+        &self,
+        probe: &partbooter_common::MachineProbe,
+        backup_root: &Path,
+    ) -> AppResult<BackupCheckpoint> {
+        match &self.probe_source {
+            ProbeSource::Live => {
+                WindowsApplyAdapter::create_backup_checkpoint(&probe.esp, backup_root)
+            }
+            #[cfg(test)]
+            ProbeSource::Fixture(_) => self.create_fixture_backup_checkpoint(backup_root),
+        }
+    }
+
+    #[cfg(test)]
+    fn create_fixture_backup_checkpoint(&self, backup_root: &Path) -> AppResult<BackupCheckpoint> {
+        let esp_backup_dir = backup_root.join("esp");
+        fs::create_dir_all(&esp_backup_dir)?;
+        fs::write(esp_backup_dir.join("shimx64.efi"), "fixture-esp-backup")?;
+
+        let bcd_store_path = backup_root.join("bcd-store.bak");
+        fs::write(&bcd_store_path, "fixture-bcd-export")?;
+
+        Ok(BackupCheckpoint {
+            esp_backup_dir,
+            bcd_store_path,
+            notes: vec!["Fixture checkpoint created for tests.".to_string()],
+        })
+    }
 }
 
 fn unique_suffix() -> String {
@@ -355,8 +439,8 @@ fn iso_timestamp() -> String {
 mod tests {
     use super::PartBooterService;
     use partbooter_common::{
-        EspInfo, FirmwareMode, HostPlatform, MachineProbe, OperationStatus, PartitionStyle,
-        PayloadKind,
+        ActionOutcome, EspInfo, FirmwareMode, HostPlatform, MachineProbe, OperationStatus,
+        PartitionStyle, PayloadKind, PlanStepKind,
     };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -415,12 +499,18 @@ mod tests {
             .build_plan("C:\\images\\winpe_boot.wim", "D:")
             .expect("plan should succeed");
         let journal = service.apply_plan(&plan).expect("apply should succeed");
-        assert_eq!(journal.status, OperationStatus::Applied);
+        assert_eq!(journal.status, OperationStatus::Checkpointed);
+        assert_eq!(journal.steps[0].outcome, ActionOutcome::Completed);
+        assert_eq!(journal.steps[1].kind, PlanStepKind::SnapshotBootConfig);
+        assert_eq!(journal.steps[2].outcome, ActionOutcome::Skipped);
 
         let report = service
             .verify_operation(&journal.operation_id)
             .expect("verify should succeed");
         assert!(report.verified);
+        assert!(report.backup_artifacts_present);
+        assert!(report.operation_plan_present);
+        assert!(!report.boot_entry_registered);
     }
 
     #[test]
