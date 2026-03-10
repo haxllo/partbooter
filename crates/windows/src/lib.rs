@@ -400,19 +400,19 @@ fn register_winpe_boot_entry_impl(
     display_name: &str,
 ) -> AppResult<BootEntryRegistration> {
     let entry_id = create_bcd_object(display_name, "osloader")?;
-    let ramdisk_options_id = ensure_ramdisk_options_object()?;
+    let ramdisk_options_device_id = ensure_ramdisk_options_object()?;
     let registration = (|| {
         let volume_token = &staging.target_volume;
         let ramdisk_wim_path = windows_volume_relative_path(&staging.boot_wim_path, volume_token)?;
         configure_ramdisk_options(
-            &ramdisk_options_id,
+            &ramdisk_options_device_id,
             &staging.boot_sdi_relative_path,
             volume_token,
         )?;
         configure_ramdisk_loader_device(
             &entry_id,
             &ramdisk_wim_path,
-            &ramdisk_options_id,
+            &ramdisk_options_device_id,
             volume_token,
         )?;
         set_bcd_value(&entry_id, "path", r"\Windows\System32\winload.efi")?;
@@ -425,7 +425,7 @@ fn register_winpe_boot_entry_impl(
 
         Ok(BootEntryRegistration {
             entry_id: entry_id.clone(),
-            ramdisk_options_id: ramdisk_options_id.clone(),
+            ramdisk_options_id: RAMDISK_OPTIONS_ID.to_string(),
             display_name: display_name.to_string(),
         })
     })();
@@ -634,7 +634,7 @@ fn ensure_ramdisk_options_object() -> AppResult<String> {
         .args(["/enum", RAMDISK_OPTIONS_ID])
         .output()?;
     if enum_output.status.success() {
-        return Ok(RAMDISK_OPTIONS_ID.to_string());
+        return resolve_bcd_identifier_verbose(RAMDISK_OPTIONS_ID);
     }
 
     let output = Command::new("bcdedit")
@@ -663,7 +663,33 @@ fn ensure_ramdisk_options_object() -> AppResult<String> {
         ));
     }
 
-    Ok(RAMDISK_OPTIONS_ID.to_string())
+    resolve_bcd_identifier_verbose(RAMDISK_OPTIONS_ID)
+}
+
+#[cfg(windows)]
+fn resolve_bcd_identifier_verbose(identifier: &str) -> AppResult<String> {
+    let output = Command::new("bcdedit")
+        .args(["/enum", identifier, "/v"])
+        .output()?;
+    if !output.status.success() {
+        let detail = join_command_output(&output.stdout, &output.stderr);
+        return Err(AppError::new(
+            AppErrorKind::Io,
+            if detail.is_empty() {
+                format!(
+                    "bcdedit failed to resolve {} with /v using exit status {}",
+                    identifier, output.status
+                )
+            } else {
+                format!(
+                    "bcdedit failed to resolve {} with /v using exit status {}: {}",
+                    identifier, output.status, detail
+                )
+            },
+        ));
+    }
+
+    parse_identifier_from_bcd_enum_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(windows)]
@@ -762,6 +788,24 @@ fn parse_guid_from_bcd_output(output: &str) -> AppResult<String> {
         )
     })?;
     Ok(output[start..=start + end].trim().to_string())
+}
+
+#[cfg(any(windows, test))]
+fn parse_identifier_from_bcd_enum_output(output: &str) -> AppResult<String> {
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if let Some(value) = line.strip_prefix("identifier") {
+            let identifier = value.trim();
+            if identifier.starts_with('{') && identifier.ends_with('}') {
+                return Ok(identifier.to_string());
+            }
+        }
+    }
+
+    Err(AppError::new(
+        AppErrorKind::Validation,
+        "could not find an identifier line in bcdedit /enum /v output",
+    ))
 }
 
 #[cfg(windows)]
@@ -1004,7 +1048,7 @@ fn missing_field(name: &str) -> AppError {
 mod tests {
     #[cfg(not(windows))]
     use super::WindowsProbeAdapter;
-    use super::{parse_probe_output, robocopy_succeeded};
+    use super::{parse_identifier_from_bcd_enum_output, parse_probe_output, robocopy_succeeded};
     use partbooter_common::{FirmwareMode, PartitionStyle};
 
     #[test]
@@ -1055,5 +1099,15 @@ mod tests {
         assert!(args.contains(&"BCD"));
         assert!(args.contains(&"BCD.LOG"));
         assert!(args.contains(&"BCD.LOG*"));
+    }
+
+    #[test]
+    fn parses_verbose_bcd_identifier_output() {
+        let parsed = parse_identifier_from_bcd_enum_output(
+            "Ramdisk Options\n----------------\nidentifier              {7619dcc8-fafe-11d9-b411-000476eba25f}\ndescription             Windows Recovery\n",
+        )
+        .expect("verbose bcdedit output should yield an identifier");
+
+        assert_eq!(parsed, "{7619dcc8-fafe-11d9-b411-000476eba25f}");
     }
 }
