@@ -326,8 +326,9 @@ impl PartBooterService {
     pub fn rollback_operation(&self, operation_id: &str) -> AppResult<OperationJournal> {
         let mut journal = self.journal_store.load_journal(operation_id)?;
         let operation_root = self.journal_store.operation_dir(operation_id);
+        let backup_store_path = PathBuf::from(&journal.backup_root).join("bcd-store.bak");
         if let Some(metadata) = self.read_winpe_operation_metadata(&operation_root)? {
-            self.remove_registered_entry(&metadata.entry_id, &metadata.ramdisk_options_id)?;
+            self.restore_boot_config(&backup_store_path)?;
             self.remove_staged_payload(&metadata.stage_root, &metadata.esp_stage_root)?;
             self.remove_winpe_operation_metadata(&operation_root)?;
         }
@@ -455,7 +456,14 @@ impl PartBooterService {
             operation_id,
             operation_root,
         )?;
-        let registration = self.register_winpe_entry(&staging, &plan.payload.display_name)?;
+        let registration = match self.register_winpe_entry(&staging, &plan.payload.display_name) {
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = self.restore_boot_config(&checkpoint.bcd_store_path);
+                let _ = self.remove_staged_payload(&staging.stage_root, &staging.esp_stage_root);
+                return Err(error);
+            }
+        };
         let loader_spec_path = self.write_winpe_loader_spec(
             operation_root,
             &staging,
@@ -469,6 +477,8 @@ impl PartBooterService {
             &loader_spec_path,
         )?;
         if !self.verify_registered_entry(&registration.entry_id)? {
+            let _ = self.restore_boot_config(&checkpoint.bcd_store_path);
+            let _ = self.remove_staged_payload(&staging.stage_root, &staging.esp_stage_root);
             return Err(AppError::new(
                 AppErrorKind::Verification,
                 format!(
@@ -612,11 +622,9 @@ impl PartBooterService {
         }
     }
 
-    fn remove_registered_entry(&self, entry_id: &str, ramdisk_options_id: &str) -> AppResult<()> {
+    fn restore_boot_config(&self, backup_store_path: &Path) -> AppResult<()> {
         match &self.probe_source {
-            ProbeSource::Live => {
-                WindowsApplyAdapter::remove_boot_entry(entry_id, ramdisk_options_id)
-            }
+            ProbeSource::Live => WindowsApplyAdapter::restore_boot_config(backup_store_path),
             #[cfg(test)]
             ProbeSource::Fixture(_) => Ok(()),
         }
@@ -652,7 +660,6 @@ impl PartBooterService {
             "PARTBOOTER_WINPE_LOADER_V1".to_string(),
             format!("display_name={display_name}"),
             format!("entry_id={}", registration.entry_id),
-            format!("ramdisk_options_id={}", registration.ramdisk_options_id),
             format!("target_volume={}", staging.target_volume),
             format!("boot_wim_path={}", staging.boot_wim_path.display()),
             format!("boot_sdi_path={}", staging.boot_sdi_path.display()),
@@ -676,10 +683,6 @@ impl PartBooterService {
         loader_spec_path: &Path,
     ) -> AppResult<()> {
         fs::write(operation_root.join("entry-id.txt"), &registration.entry_id)?;
-        fs::write(
-            operation_root.join("ramdisk-options-id.txt"),
-            &registration.ramdisk_options_id,
-        )?;
         fs::write(
             operation_root.join("staging-root.txt"),
             staging.stage_root.display().to_string(),
@@ -714,9 +717,6 @@ impl PartBooterService {
 
         Ok(Some(WinPeOperationMetadata {
             entry_id: fs::read_to_string(entry_id_path)?.trim().to_string(),
-            ramdisk_options_id: fs::read_to_string(operation_root.join("ramdisk-options-id.txt"))?
-                .trim()
-                .to_string(),
             stage_root: PathBuf::from(
                 fs::read_to_string(operation_root.join("staging-root.txt"))?
                     .trim()
@@ -748,7 +748,6 @@ impl PartBooterService {
     fn remove_winpe_operation_metadata(&self, operation_root: &Path) -> AppResult<()> {
         for file_name in [
             "entry-id.txt",
-            "ramdisk-options-id.txt",
             "staging-root.txt",
             "esp-staging-root.txt",
             "boot-wim-path.txt",
@@ -807,7 +806,7 @@ impl PartBooterService {
     fn fixture_winpe_registration(&self, display_name: &str) -> BootEntryRegistration {
         BootEntryRegistration {
             entry_id: "{11111111-1111-1111-1111-111111111111}".to_string(),
-            ramdisk_options_id: "{22222222-2222-2222-2222-222222222222}".to_string(),
+            ramdisk_options_id: "{ramdiskoptions}".to_string(),
             display_name: format!("PartBooter {display_name}"),
         }
     }
@@ -815,7 +814,6 @@ impl PartBooterService {
 
 struct WinPeOperationMetadata {
     entry_id: String,
-    ramdisk_options_id: String,
     stage_root: PathBuf,
     esp_stage_root: PathBuf,
     boot_wim_path: PathBuf,

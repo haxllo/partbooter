@@ -178,6 +178,9 @@ pub struct BootEntryRegistration {
 
 pub struct WindowsApplyAdapter;
 
+#[cfg(windows)]
+const RAMDISK_OPTIONS_ID: &str = "{ramdiskoptions}";
+
 impl WindowsApplyAdapter {
     pub fn create_backup_checkpoint(
         esp: &EspInfo,
@@ -215,6 +218,10 @@ impl WindowsApplyAdapter {
         esp_stage_root: impl AsRef<Path>,
     ) -> AppResult<()> {
         remove_staged_payload_impl(stage_root.as_ref(), esp_stage_root.as_ref())
+    }
+
+    pub fn restore_boot_config(backup_store_path: impl AsRef<Path>) -> AppResult<()> {
+        restore_boot_config_impl(backup_store_path.as_ref())
     }
 }
 
@@ -402,7 +409,7 @@ fn register_winpe_boot_entry_impl(
     display_name: &str,
 ) -> AppResult<BootEntryRegistration> {
     let entry_id = create_bcd_object(display_name, "osloader")?;
-    let ramdisk_options_id = create_device_options_object(&format!("{display_name} options"))?;
+    let ramdisk_options_id = ensure_ramdisk_options_object()?;
     let registration = (|| {
         let volume_token = &staging.target_volume;
         let ramdisk_wim_path = windows_volume_relative_path(&staging.boot_wim_path, volume_token)?;
@@ -439,7 +446,6 @@ fn register_winpe_boot_entry_impl(
 
     if let Err(error) = registration {
         let _ = delete_bcd_object(&entry_id);
-        let _ = delete_bcd_object(&ramdisk_options_id);
         return Err(error);
     }
 
@@ -474,7 +480,9 @@ fn verify_boot_entry_impl(_entry_id: &str) -> AppResult<bool> {
 #[cfg(windows)]
 fn remove_boot_entry_impl(entry_id: &str, ramdisk_options_id: &str) -> AppResult<()> {
     delete_bcd_object(entry_id)?;
-    delete_bcd_object(ramdisk_options_id)?;
+    if !ramdisk_options_id.eq_ignore_ascii_case(RAMDISK_OPTIONS_ID) {
+        delete_bcd_object(ramdisk_options_id)?;
+    }
     Ok(())
 }
 
@@ -591,6 +599,44 @@ fn configure_ramdisk_options(ramdisk_options_id: &str, ramdisk_sdi_path: &str) -
 }
 
 #[cfg(windows)]
+fn ensure_ramdisk_options_object() -> AppResult<String> {
+    let enum_output = Command::new("bcdedit")
+        .args(["/enum", RAMDISK_OPTIONS_ID])
+        .output()?;
+    if enum_output.status.success() {
+        return Ok(RAMDISK_OPTIONS_ID.to_string());
+    }
+
+    let output = Command::new("bcdedit")
+        .args([
+            "/create",
+            RAMDISK_OPTIONS_ID,
+            "/d",
+            "PartBooter ramdisk options",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let detail = join_command_output(&output.stdout, &output.stderr);
+        return Err(AppError::new(
+            AppErrorKind::Io,
+            if detail.is_empty() {
+                format!(
+                    "bcdedit failed to create {} with exit status {}",
+                    RAMDISK_OPTIONS_ID, output.status
+                )
+            } else {
+                format!(
+                    "bcdedit failed to create {} with exit status {}: {}",
+                    RAMDISK_OPTIONS_ID, output.status, detail
+                )
+            },
+        ));
+    }
+
+    Ok(RAMDISK_OPTIONS_ID.to_string())
+}
+
+#[cfg(windows)]
 fn create_bcd_object(description: &str, application: &str) -> AppResult<String> {
     let output = Command::new("bcdedit")
         .args(["/create", "/d", description, "/application", application])
@@ -608,28 +654,27 @@ fn create_bcd_object(description: &str, application: &str) -> AppResult<String> 
 }
 
 #[cfg(windows)]
-fn create_device_options_object(description: &str) -> AppResult<String> {
-    let output = Command::new("bcdedit")
-        .args(["/create", "/d", description, "/device"])
-        .output()?;
-    if !output.status.success() {
-        return Err(AppError::new(
-            AppErrorKind::Io,
-            format!(
-                "bcdedit /create /device for {description} failed with exit status {}",
-                output.status
-            ),
-        ));
-    }
-    parse_guid_from_bcd_output(&String::from_utf8_lossy(&output.stdout))
-}
-
-#[cfg(windows)]
 fn set_bcd_value(entry_id: &str, key: &str, value: &str) -> AppResult<()> {
     run_bcdedit_status(
         ["/set", entry_id, key, value],
         &format!("set {key} on {entry_id}"),
     )
+}
+
+#[cfg(windows)]
+fn restore_boot_config_impl(backup_store_path: &Path) -> AppResult<()> {
+    run_bcdedit_status(
+        ["/import", &backup_store_path.display().to_string()],
+        &format!("import BCD store from {}", backup_store_path.display()),
+    )
+}
+
+#[cfg(not(windows))]
+fn restore_boot_config_impl(_backup_store_path: &Path) -> AppResult<()> {
+    Err(AppError::new(
+        AppErrorKind::UnsupportedEnvironment,
+        "PartBooter BCD restore only runs on Windows hosts",
+    ))
 }
 
 #[cfg(windows)]
