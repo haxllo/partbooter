@@ -386,31 +386,40 @@ fn register_winpe_boot_entry_impl(
 ) -> AppResult<BootEntryRegistration> {
     let entry_id = create_bcd_object(display_name, "osloader")?;
     let ramdisk_options_id = create_device_options_object(&format!("{display_name} options"))?;
+    let registration = (|| {
+        let volume_token = &staging.target_volume;
+        let ramdisk_sdi_path = windows_volume_relative_path(&staging.boot_sdi_path, volume_token)?;
+        let ramdisk_wim_path = windows_volume_relative_path(&staging.boot_wim_path, volume_token)?;
+        let volume_spec =
+            configure_ramdisk_options(&ramdisk_options_id, &ramdisk_sdi_path, volume_token)?;
+        let ramdisk_device_base =
+            format!("ramdisk={}{}", volume_spec.ramdisk_prefix, ramdisk_wim_path);
+        let ramdisk_device = format!("{ramdisk_device_base},{ramdisk_options_id}");
 
-    let volume_token = &staging.target_volume;
-    let ramdisk_sdi_path = windows_volume_relative_path(&staging.boot_sdi_path, volume_token)?;
-    let ramdisk_wim_path = windows_volume_relative_path(&staging.boot_wim_path, volume_token)?;
-    let ramdisk_device = format!("ramdisk=[{volume_token}]{ramdisk_wim_path},{ramdisk_options_id}");
-    let partition_device = format!("partition={volume_token}");
+        set_bcd_value(&entry_id, "device", &ramdisk_device)?;
+        set_bcd_value(&entry_id, "osdevice", &ramdisk_device)?;
+        set_bcd_value(&entry_id, "path", r"\Windows\System32\winload.efi")?;
+        set_bcd_value(&entry_id, "systemroot", r"\Windows")?;
+        set_bcd_value(&entry_id, "winpe", "yes")?;
+        set_bcd_value(&entry_id, "detecthal", "yes")?;
+        set_bcd_value(&entry_id, "nx", "OptIn")?;
 
-    set_bcd_value(&ramdisk_options_id, "ramdisksdidevice", &partition_device)?;
-    set_bcd_value(&ramdisk_options_id, "ramdisksdipath", &ramdisk_sdi_path)?;
+        add_bcd_display_order(&entry_id)?;
 
-    set_bcd_value(&entry_id, "device", &ramdisk_device)?;
-    set_bcd_value(&entry_id, "osdevice", &ramdisk_device)?;
-    set_bcd_value(&entry_id, "path", r"\Windows\System32\winload.efi")?;
-    set_bcd_value(&entry_id, "systemroot", r"\Windows")?;
-    set_bcd_value(&entry_id, "winpe", "yes")?;
-    set_bcd_value(&entry_id, "detecthal", "yes")?;
-    set_bcd_value(&entry_id, "nx", "OptIn")?;
+        Ok(BootEntryRegistration {
+            entry_id: entry_id.clone(),
+            ramdisk_options_id: ramdisk_options_id.clone(),
+            display_name: display_name.to_string(),
+        })
+    })();
 
-    add_bcd_display_order(&entry_id)?;
+    if let Err(error) = registration {
+        let _ = delete_bcd_object(&entry_id);
+        let _ = delete_bcd_object(&ramdisk_options_id);
+        return Err(error);
+    }
 
-    Ok(BootEntryRegistration {
-        entry_id,
-        ramdisk_options_id,
-        display_name: display_name.to_string(),
-    })
+    registration
 }
 
 #[cfg(not(windows))]
@@ -440,11 +449,8 @@ fn verify_boot_entry_impl(_entry_id: &str) -> AppResult<bool> {
 
 #[cfg(windows)]
 fn remove_boot_entry_impl(entry_id: &str, ramdisk_options_id: &str) -> AppResult<()> {
-    run_bcdedit_status(["/delete", entry_id], "delete managed WinPE boot entry")?;
-    run_bcdedit_status(
-        ["/delete", ramdisk_options_id],
-        "delete managed ramdisk options entry",
-    )?;
+    delete_bcd_object(entry_id)?;
+    delete_bcd_object(ramdisk_options_id)?;
     Ok(())
 }
 
@@ -478,6 +484,13 @@ fn remove_staged_payload_impl(_stage_root: &Path) -> AppResult<()> {
         AppErrorKind::UnsupportedEnvironment,
         "PartBooter staged-payload cleanup only runs on Windows hosts",
     ))
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BcdVolumeSpec {
+    partition_device: String,
+    ramdisk_prefix: String,
 }
 
 #[cfg(windows)]
@@ -525,6 +538,44 @@ fn locate_boot_sdi_source() -> AppResult<PathBuf> {
         AppErrorKind::Io,
         "unable to locate boot.sdi on the host; checked common Windows boot paths",
     ))
+}
+
+#[cfg(windows)]
+fn configure_ramdisk_options(
+    ramdisk_options_id: &str,
+    ramdisk_sdi_path: &str,
+    volume_token: &str,
+) -> AppResult<BcdVolumeSpec> {
+    let mut last_error = None;
+    for spec in candidate_bcd_volume_specs(volume_token) {
+        match set_bcd_value(
+            ramdisk_options_id,
+            "ramdisksdidevice",
+            &spec.partition_device,
+        ) {
+            Ok(()) => {
+                set_bcd_value(ramdisk_options_id, "ramdisksdipath", ramdisk_sdi_path)?;
+                return Ok(spec);
+            }
+            Err(error) => {
+                last_error = Some(AppError::new(
+                    error.kind(),
+                    format!(
+                        "failed to set ramdisksdidevice using {}: {}",
+                        spec.partition_device,
+                        error.message()
+                    ),
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        AppError::new(
+            AppErrorKind::Io,
+            "no candidate BCD volume device syntax was available",
+        )
+    }))
 }
 
 #[cfg(windows)]
@@ -579,15 +630,34 @@ fn add_bcd_display_order(entry_id: &str) -> AppResult<()> {
 
 #[cfg(windows)]
 fn run_bcdedit_status<const N: usize>(args: [&str; N], action: &str) -> AppResult<()> {
-    let status = Command::new("bcdedit").args(args).status()?;
-    if status.success() {
+    let output = Command::new("bcdedit").args(args).output()?;
+    if output.status.success() {
         Ok(())
     } else {
+        let detail = join_command_output(&output.stdout, &output.stderr);
         Err(AppError::new(
             AppErrorKind::Io,
-            format!("bcdedit failed to {action} with exit status {status}"),
+            if detail.is_empty() {
+                format!(
+                    "bcdedit failed to {action} with exit status {}",
+                    output.status
+                )
+            } else {
+                format!(
+                    "bcdedit failed to {action} with exit status {}: {detail}",
+                    output.status
+                )
+            },
         ))
     }
+}
+
+#[cfg(windows)]
+fn delete_bcd_object(entry_id: &str) -> AppResult<()> {
+    run_bcdedit_status(
+        ["/delete", entry_id],
+        &format!("delete BCD object {entry_id}"),
+    )
 }
 
 #[cfg(windows)]
@@ -605,6 +675,105 @@ fn parse_guid_from_bcd_output(output: &str) -> AppResult<String> {
         )
     })?;
     Ok(output[start..=start + end].trim().to_string())
+}
+
+#[cfg(any(windows, test))]
+fn candidate_bcd_volume_specs(volume_token: &str) -> Vec<BcdVolumeSpec> {
+    let mut candidates = Vec::new();
+
+    if let Some(native_device) = resolve_native_volume_device(volume_token) {
+        candidates.push(BcdVolumeSpec {
+            partition_device: format!("partition={native_device}"),
+            ramdisk_prefix: format!("[{native_device}]"),
+        });
+    }
+
+    candidates.push(BcdVolumeSpec {
+        partition_device: format!("partition={volume_token}"),
+        ramdisk_prefix: format!("[{volume_token}]"),
+    });
+
+    candidates
+}
+
+#[cfg(windows)]
+fn resolve_native_volume_device(volume_token: &str) -> Option<String> {
+    let output = Command::new("fltmc").arg("volumes").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_fltmc_volume_device(&String::from_utf8_lossy(&output.stdout), volume_token)
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_native_volume_device(_volume_token: &str) -> Option<String> {
+    None
+}
+
+#[cfg(any(windows, test))]
+fn parse_fltmc_volume_device(output: &str, volume_token: &str) -> Option<String> {
+    let mut current_device = None::<String>;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("Filter Manager")
+            || line.starts_with("Volume Name")
+            || line.starts_with('-')
+        {
+            continue;
+        }
+
+        if let Some(device) = parse_native_device_from_line(line) {
+            if line_mentions_volume_token(line, volume_token) {
+                return Some(device.to_string());
+            }
+            current_device = Some(device.to_string());
+            continue;
+        }
+
+        if line_mentions_volume_token(line, volume_token) {
+            if let Some(device) = &current_device {
+                return Some(device.clone());
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(any(windows, test))]
+fn parse_native_device_from_line(line: &str) -> Option<&str> {
+    let token = line.split_whitespace().next()?;
+    if token.starts_with(r"\Device\") {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(windows, test))]
+fn line_mentions_volume_token(line: &str, volume_token: &str) -> bool {
+    let normalized = volume_token.trim().trim_end_matches(['\\', '/']);
+    line.split_whitespace().any(|segment| {
+        segment
+            .trim_matches(|c| c == '(' || c == ')' || c == ',')
+            .eq_ignore_ascii_case(normalized)
+    })
+}
+
+#[cfg(windows)]
+fn join_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout_text = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
+
+    match (stdout_text.is_empty(), stderr_text.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout_text,
+        (true, false) => stderr_text,
+        (false, false) => format!("{stdout_text} | {stderr_text}"),
+    }
 }
 
 #[cfg(windows)]
@@ -828,7 +997,10 @@ fn missing_field(name: &str) -> AppError {
 mod tests {
     #[cfg(not(windows))]
     use super::WindowsProbeAdapter;
-    use super::{parse_probe_output, robocopy_succeeded};
+    use super::{
+        candidate_bcd_volume_specs, parse_fltmc_volume_device, parse_probe_output,
+        robocopy_succeeded,
+    };
     use partbooter_common::{FirmwareMode, PartitionStyle};
 
     #[test]
@@ -879,5 +1051,39 @@ mod tests {
         assert!(args.contains(&"BCD"));
         assert!(args.contains(&"BCD.LOG"));
         assert!(args.contains(&"BCD.LOG*"));
+    }
+
+    #[test]
+    fn parses_native_volume_device_from_fltmc_output() {
+        let output = r#"
+Filter Manager volumes
+----------------------
+Volume Name                                Altitude   Frame
+-----------------------------------------  --------   -----
+\Device\HarddiskVolume4                    0          0
+C:
+\Device\HarddiskVolume7                    0          0
+D:
+"#;
+
+        let parsed = parse_fltmc_volume_device(output, "D:");
+        assert_eq!(parsed.as_deref(), Some(r"\Device\HarddiskVolume7"));
+    }
+
+    #[test]
+    fn candidate_bcd_volume_specs_always_include_drive_letter_fallback() {
+        let candidates = candidate_bcd_volume_specs("D:");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.partition_device == "partition=D:"),
+            "drive-letter partition fallback should always be present"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.ramdisk_prefix == "[D:]"),
+            "drive-letter ramdisk prefix fallback should always be present"
+        );
     }
 }
