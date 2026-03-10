@@ -360,9 +360,14 @@ impl PartBooterService {
 
     fn validate_probe(&self, probe: &partbooter_common::MachineProbe) -> AppResult<()> {
         if !probe.supported {
+            let detail = if probe.warnings.is_empty() {
+                "no additional probe detail was recorded".to_string()
+            } else {
+                probe.warnings.join(" | ")
+            };
             return Err(AppError::new(
                 AppErrorKind::UnsupportedEnvironment,
-                "PartBooter probe reported an unsupported host configuration",
+                format!("PartBooter probe reported an unsupported host configuration: {detail}"),
             ));
         }
         if probe.firmware_mode != partbooter_common::FirmwareMode::Uefi {
@@ -918,5 +923,9 @@ mod tests {
             .build_plan("C:\\images\\winpe_boot.wim", "D:")
             .expect_err("unsupported host probe should fail");
         assert_eq!(error.exit_code(), 2);
+        assert!(
+            error.message().contains("Firmware mode is not UEFI."),
+            "unsupported probe error should include probe warnings"
+        );
     }
 }

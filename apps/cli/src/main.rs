@@ -34,6 +34,10 @@ fn run() -> Result<(), AppError> {
                 println!("secure boot: {}", probe.secure_boot_enabled);
                 println!("bitlocker detected: {}", probe.bitlocker_detected);
                 println!("esp volume: {}", probe.esp.volume);
+                println!("supported: {}", probe.supported);
+                for warning in &probe.warnings {
+                    println!("warning: {warning}");
+                }
             }
             Ok(())
         }

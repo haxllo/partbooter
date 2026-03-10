@@ -15,6 +15,7 @@ $ErrorActionPreference = "Stop"
 $warnings = @()
 
 $firmwareMode = "bios"
+$firmwareRegistryUnavailable = $false
 try {
     $firmwareType = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name 'PEFirmwareType' -ErrorAction Stop).PEFirmwareType
     if ($firmwareType -eq 2) {
@@ -22,7 +23,7 @@ try {
     }
 }
 catch {
-    $warnings += "Unable to determine firmware mode from PEFirmwareType."
+    $firmwareRegistryUnavailable = $true
 }
 
 $systemDisk = Get-Disk -ErrorAction SilentlyContinue | Where-Object { ($_.IsBoot -eq $true) -or ($_.IsSystem -eq $true) } | Select-Object -First 1
@@ -58,6 +59,27 @@ if ($systemDisk) {
 }
 if (-not $espPartition) {
     $espPartition = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.GptType -eq $espGuid } | Select-Object -First 1
+}
+
+if ($firmwareMode -ne "uefi") {
+    $currentBootEntry = @(bcdedit /enum '{current}' 2>$null)
+    if (($LASTEXITCODE -eq 0) -and ($currentBootEntry.Count -gt 0)) {
+        $loaderPathLine = $currentBootEntry | Where-Object { $_ -match '^\s*path\s+' } | Select-Object -First 1
+        if ($loaderPathLine -match 'winload\.efi') {
+            $firmwareMode = "uefi"
+        } elseif ($loaderPathLine -match 'winload\.exe') {
+            $firmwareMode = "bios"
+        }
+    }
+}
+
+if (($firmwareMode -ne "uefi") -and ($partitionStyle -eq "gpt") -and $espPartition) {
+    $firmwareMode = "uefi"
+    $warnings += "Firmware mode inferred from GPT system disk and EFI System Partition."
+}
+
+if (($firmwareMode -ne "uefi") -and $firmwareRegistryUnavailable) {
+    $warnings += "Unable to determine firmware mode from PEFirmwareType or current boot loader."
 }
 
 $espVolume = ""
