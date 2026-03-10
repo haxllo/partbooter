@@ -671,6 +671,10 @@ fn resolve_bcd_identifier_verbose(identifier: &str) -> AppResult<String> {
     let output = Command::new("bcdedit")
         .args(["/enum", identifier, "/v"])
         .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Ok(parsed_identifier) = parse_identifier_from_bcd_enum_output(&stdout) {
+        return Ok(parsed_identifier);
+    }
     if !output.status.success() {
         let detail = join_command_output(&output.stdout, &output.stderr);
         return Err(AppError::new(
@@ -689,7 +693,7 @@ fn resolve_bcd_identifier_verbose(identifier: &str) -> AppResult<String> {
         ));
     }
 
-    parse_identifier_from_bcd_enum_output(&String::from_utf8_lossy(&output.stdout))
+    parse_identifier_from_bcd_enum_output(&stdout)
 }
 
 #[cfg(windows)]
@@ -1109,5 +1113,15 @@ mod tests {
         .expect("verbose bcdedit output should yield an identifier");
 
         assert_eq!(parsed, "{7619dcc8-fafe-11d9-b411-000476eba25f}");
+    }
+
+    #[test]
+    fn parses_verbose_bcd_identifier_output_even_with_following_error_text() {
+        let parsed = parse_identifier_from_bcd_enum_output(
+            "Setup Ramdisk Options\n---------------------\nidentifier              {ae5534e0-a924-466c-b836-758539a3ee3a}\ndescription             PartBooter ramdisk options\nA device which does not exist was specified.\n",
+        )
+        .expect("identifier should still parse when bcdedit appends an error line");
+
+        assert_eq!(parsed, "{ae5534e0-a924-466c-b836-758539a3ee3a}");
     }
 }
