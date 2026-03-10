@@ -337,17 +337,12 @@ fn create_backup_checkpoint_impl(
 fn stage_winpe_payload_impl(
     source_wim: &Path,
     _target_volume: &str,
-    operation_id: &str,
+    _operation_id: &str,
     _esp: &EspInfo,
 ) -> AppResult<WinPeStaging> {
     let boot_volume = system_volume_token()?;
     let boot_root = normalize_volume_root(&boot_volume)?;
-    let stage_root = boot_root
-        .join("Boot")
-        .join("PartBooter")
-        .join("Operations")
-        .join(operation_id)
-        .join("WinPE");
+    let stage_root = boot_root.join("Boot").join("PartBooter");
     fs::create_dir_all(&stage_root)?;
 
     let boot_wim_path = stage_root.join("boot.wim");
@@ -381,9 +376,7 @@ fn stage_winpe_payload_impl(
         esp_stage_root,
         boot_wim_path,
         boot_sdi_path,
-        boot_sdi_relative_path: format!(
-            r"\Boot\PartBooter\Operations\{operation_id}\WinPE\boot.sdi"
-        ),
+        boot_sdi_relative_path: r"\Boot\PartBooter\boot.sdi".to_string(),
         target_volume: boot_volume,
     })
 }
@@ -416,29 +409,12 @@ fn register_winpe_boot_entry_impl(
             &staging.boot_sdi_relative_path,
             volume_token,
         )?;
-        let ramdisk_device_base = format!("ramdisk=[{volume_token}]{}", ramdisk_wim_path);
-        let ramdisk_device = format!("{ramdisk_device_base},{ramdisk_options_id}");
-
-        set_bcd_value(&entry_id, "device", &ramdisk_device).map_err(|error| {
-            AppError::new(
-                error.kind(),
-                format!(
-                    "failed to set device to {}: {}",
-                    ramdisk_device,
-                    error.message()
-                ),
-            )
-        })?;
-        set_bcd_value(&entry_id, "osdevice", &ramdisk_device).map_err(|error| {
-            AppError::new(
-                error.kind(),
-                format!(
-                    "failed to set osdevice to {}: {}",
-                    ramdisk_device,
-                    error.message()
-                ),
-            )
-        })?;
+        configure_ramdisk_loader_device(
+            &entry_id,
+            &ramdisk_wim_path,
+            &ramdisk_options_id,
+            volume_token,
+        )?;
         set_bcd_value(&entry_id, "path", r"\Windows\System32\winload.efi")?;
         set_bcd_value(&entry_id, "systemroot", r"\Windows")?;
         set_bcd_value(&entry_id, "winpe", "yes")?;
@@ -539,13 +515,6 @@ fn remove_staged_payload_impl(_stage_root: &Path, _esp_stage_root: &Path) -> App
     ))
 }
 
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BcdVolumeSpec {
-    partition_device: String,
-    ramdisk_prefix: String,
-}
-
 #[cfg(windows)]
 fn is_usable_mount_point(path: &str) -> bool {
     let trimmed = path.trim();
@@ -612,6 +581,51 @@ fn configure_ramdisk_options(
     })?;
     set_bcd_value(ramdisk_options_id, "ramdisksdipath", ramdisk_sdi_path)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn configure_ramdisk_loader_device(
+    entry_id: &str,
+    ramdisk_wim_path: &str,
+    ramdisk_options_id: &str,
+    volume_token: &str,
+) -> AppResult<String> {
+    let candidates = [
+        format!("ramdisk=[{volume_token}]{ramdisk_wim_path},{ramdisk_options_id}"),
+        format!("ramdisk=[boot]{ramdisk_wim_path},{ramdisk_options_id}"),
+    ];
+
+    let mut last_error = None;
+    for candidate in candidates {
+        match set_bcd_value(entry_id, "device", &candidate) {
+            Ok(()) => {
+                set_bcd_value(entry_id, "osdevice", &candidate).map_err(|error| {
+                    AppError::new(
+                        error.kind(),
+                        format!(
+                            "failed to set osdevice to {}: {}",
+                            candidate,
+                            error.message()
+                        ),
+                    )
+                })?;
+                return Ok(candidate);
+            }
+            Err(error) => {
+                last_error = Some(AppError::new(
+                    error.kind(),
+                    format!("failed to set device to {}: {}", candidate, error.message()),
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        AppError::new(
+            AppErrorKind::Io,
+            "no candidate ramdisk loader device syntax was available",
+        )
+    }))
 }
 
 #[cfg(windows)]
@@ -748,146 +762,6 @@ fn parse_guid_from_bcd_output(output: &str) -> AppResult<String> {
         )
     })?;
     Ok(output[start..=start + end].trim().to_string())
-}
-
-#[cfg(any(windows, test))]
-fn candidate_bcd_volume_specs(volume_token: &str) -> Vec<BcdVolumeSpec> {
-    let mut candidates = Vec::new();
-
-    if let Some(native_device) = resolve_native_volume_device(volume_token) {
-        candidates.push(BcdVolumeSpec {
-            partition_device: format!("partition={native_device}"),
-            ramdisk_prefix: format!("[{native_device}]"),
-        });
-    }
-
-    candidates.push(BcdVolumeSpec {
-        partition_device: format!("partition={volume_token}"),
-        ramdisk_prefix: format!("[{volume_token}]"),
-    });
-
-    candidates
-}
-
-#[cfg(windows)]
-fn resolve_native_volume_device(volume_token: &str) -> Option<String> {
-    let aliases = volume_aliases(volume_token);
-    let output = Command::new("fltmc").arg("volumes").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_fltmc_volume_device(&String::from_utf8_lossy(&output.stdout), &aliases)
-}
-
-#[cfg(not(windows))]
-#[cfg_attr(not(test), allow(dead_code))]
-fn resolve_native_volume_device(_volume_token: &str) -> Option<String> {
-    None
-}
-
-#[cfg(any(windows, test))]
-fn parse_fltmc_volume_device(output: &str, aliases: &[String]) -> Option<String> {
-    let mut current_device = None::<String>;
-
-    for raw_line in output.lines() {
-        let line = raw_line.trim();
-        if line.is_empty()
-            || line.starts_with("Filter Manager")
-            || line.starts_with("Volume Name")
-            || line.starts_with('-')
-        {
-            continue;
-        }
-
-        if let Some(device) = parse_native_device_from_line(line) {
-            if line_mentions_volume_alias(line, aliases) {
-                return Some(device.to_string());
-            }
-            current_device = Some(device.to_string());
-            continue;
-        }
-
-        if line_mentions_volume_alias(line, aliases) {
-            if let Some(device) = &current_device {
-                return Some(device.clone());
-            }
-        }
-    }
-
-    None
-}
-
-#[cfg(any(windows, test))]
-fn parse_native_device_from_line(line: &str) -> Option<&str> {
-    let token = line.split_whitespace().next()?;
-    if token.starts_with(r"\Device\") {
-        Some(token)
-    } else {
-        None
-    }
-}
-
-#[cfg(any(windows, test))]
-fn line_mentions_volume_alias(line: &str, aliases: &[String]) -> bool {
-    line.split_whitespace().any(|segment| {
-        let normalized_segment =
-            segment.trim_matches(|c| matches!(c, '(' | ')' | ',' | '\\' | '/'));
-        aliases
-            .iter()
-            .any(|alias| normalized_segment.eq_ignore_ascii_case(alias))
-    })
-}
-
-#[cfg(any(windows, test))]
-#[cfg_attr(not(windows), allow(dead_code))]
-fn normalize_volume_alias(alias: &str) -> String {
-    alias
-        .trim()
-        .trim_matches(|c| matches!(c, '(' | ')' | ',' | '\\' | '/'))
-        .to_string()
-}
-
-#[cfg(any(windows, test))]
-#[cfg_attr(not(windows), allow(dead_code))]
-fn volume_aliases(volume_token: &str) -> Vec<String> {
-    let mut aliases = vec![normalize_volume_alias(volume_token)];
-
-    if let Some(guid_path) = resolve_volume_guid_path(volume_token) {
-        let normalized_guid = normalize_volume_alias(&guid_path);
-        if !normalized_guid.is_empty()
-            && !aliases
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&normalized_guid))
-        {
-            aliases.push(normalized_guid);
-        }
-    }
-
-    aliases
-}
-
-#[cfg(windows)]
-fn resolve_volume_guid_path(volume_token: &str) -> Option<String> {
-    let mount_target = format!("{volume_token}\\");
-    let output = Command::new("mountvol")
-        .args([mount_target.as_str(), "/L"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with(r"\\?\Volume{"))
-        .map(str::to_string)
-}
-
-#[cfg(not(windows))]
-#[cfg_attr(not(test), allow(dead_code))]
-fn resolve_volume_guid_path(_volume_token: &str) -> Option<String> {
-    None
 }
 
 #[cfg(windows)]
@@ -1130,10 +1004,7 @@ fn missing_field(name: &str) -> AppError {
 mod tests {
     #[cfg(not(windows))]
     use super::WindowsProbeAdapter;
-    use super::{
-        candidate_bcd_volume_specs, parse_fltmc_volume_device, parse_probe_output,
-        robocopy_succeeded,
-    };
+    use super::{parse_probe_output, robocopy_succeeded};
     use partbooter_common::{FirmwareMode, PartitionStyle};
 
     #[test]
@@ -1184,54 +1055,5 @@ mod tests {
         assert!(args.contains(&"BCD"));
         assert!(args.contains(&"BCD.LOG"));
         assert!(args.contains(&"BCD.LOG*"));
-    }
-
-    #[test]
-    fn parses_native_volume_device_from_fltmc_output() {
-        let output = r#"
-Filter Manager volumes
-----------------------
-Volume Name                                Altitude   Frame
------------------------------------------  --------   -----
-\Device\HarddiskVolume4                    0          0
-C:
-\Device\HarddiskVolume7                    0          0
-D:
-"#;
-
-        let parsed = parse_fltmc_volume_device(output, &[String::from("D:")]);
-        assert_eq!(parsed.as_deref(), Some(r"\Device\HarddiskVolume7"));
-    }
-
-    #[test]
-    fn parses_native_volume_device_when_fltmc_uses_trailing_backslash_aliases() {
-        let output = r#"
-Filter Manager volumes
-----------------------
-Volume Name                                Altitude   Frame
------------------------------------------  --------   -----
-\Device\HarddiskVolume9                    0          0
-D:\
-"#;
-
-        let parsed = parse_fltmc_volume_device(output, &[String::from("D:")]);
-        assert_eq!(parsed.as_deref(), Some(r"\Device\HarddiskVolume9"));
-    }
-
-    #[test]
-    fn candidate_bcd_volume_specs_always_include_drive_letter_fallback() {
-        let candidates = candidate_bcd_volume_specs("D:");
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.partition_device == "partition=D:"),
-            "drive-letter partition fallback should always be present"
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.ramdisk_prefix == "[D:]"),
-            "drive-letter ramdisk prefix fallback should always be present"
-        );
     }
 }
