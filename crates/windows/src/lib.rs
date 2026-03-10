@@ -162,8 +162,10 @@ pub struct BackupCheckpoint {
 #[derive(Debug, Clone)]
 pub struct WinPeStaging {
     pub stage_root: PathBuf,
+    pub esp_stage_root: PathBuf,
     pub boot_wim_path: PathBuf,
     pub boot_sdi_path: PathBuf,
+    pub boot_sdi_relative_path: String,
     pub target_volume: String,
 }
 
@@ -188,8 +190,9 @@ impl WindowsApplyAdapter {
         source_wim: impl AsRef<Path>,
         target_volume: &str,
         operation_id: &str,
+        esp: &EspInfo,
     ) -> AppResult<WinPeStaging> {
-        stage_winpe_payload_impl(source_wim.as_ref(), target_volume, operation_id)
+        stage_winpe_payload_impl(source_wim.as_ref(), target_volume, operation_id, esp)
     }
 
     pub fn register_winpe_boot_entry(
@@ -207,8 +210,11 @@ impl WindowsApplyAdapter {
         remove_boot_entry_impl(entry_id, ramdisk_options_id)
     }
 
-    pub fn remove_staged_payload(stage_root: impl AsRef<Path>) -> AppResult<()> {
-        remove_staged_payload_impl(stage_root.as_ref())
+    pub fn remove_staged_payload(
+        stage_root: impl AsRef<Path>,
+        esp_stage_root: impl AsRef<Path>,
+    ) -> AppResult<()> {
+        remove_staged_payload_impl(stage_root.as_ref(), esp_stage_root.as_ref())
     }
 }
 
@@ -325,6 +331,7 @@ fn stage_winpe_payload_impl(
     source_wim: &Path,
     target_volume: &str,
     operation_id: &str,
+    esp: &EspInfo,
 ) -> AppResult<WinPeStaging> {
     let target_root = normalize_volume_root(target_volume)?;
     let stage_root = target_root
@@ -347,7 +354,14 @@ fn stage_winpe_payload_impl(
     })?;
 
     let boot_sdi_source = locate_boot_sdi_source()?;
-    let boot_sdi_path = stage_root.join("boot.sdi");
+    let esp_root = resolve_esp_access_root(esp)?;
+    let esp_stage_root = esp_root
+        .join("PartBooter")
+        .join("Operations")
+        .join(operation_id)
+        .join("WinPE");
+    fs::create_dir_all(&esp_stage_root)?;
+    let boot_sdi_path = esp_stage_root.join("boot.sdi");
     fs::copy(&boot_sdi_source, &boot_sdi_path).map_err(|error| {
         AppError::new(
             AppErrorKind::Io,
@@ -361,8 +375,10 @@ fn stage_winpe_payload_impl(
 
     Ok(WinPeStaging {
         stage_root,
+        esp_stage_root,
         boot_wim_path,
         boot_sdi_path,
+        boot_sdi_relative_path: format!(r"\PartBooter\Operations\{operation_id}\WinPE\boot.sdi"),
         target_volume: normalized_volume_token(target_volume)?,
     })
 }
@@ -372,6 +388,7 @@ fn stage_winpe_payload_impl(
     _source_wim: &Path,
     _target_volume: &str,
     _operation_id: &str,
+    _esp: &EspInfo,
 ) -> AppResult<WinPeStaging> {
     Err(AppError::new(
         AppErrorKind::UnsupportedEnvironment,
@@ -388,10 +405,17 @@ fn register_winpe_boot_entry_impl(
     let ramdisk_options_id = create_device_options_object(&format!("{display_name} options"))?;
     let registration = (|| {
         let volume_token = &staging.target_volume;
-        let ramdisk_sdi_path = windows_volume_relative_path(&staging.boot_sdi_path, volume_token)?;
         let ramdisk_wim_path = windows_volume_relative_path(&staging.boot_wim_path, volume_token)?;
-        let volume_spec =
-            configure_ramdisk_options(&ramdisk_options_id, &ramdisk_sdi_path, volume_token)?;
+        configure_ramdisk_options(&ramdisk_options_id, &staging.boot_sdi_relative_path)?;
+        let volume_spec = candidate_bcd_volume_specs(volume_token)
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                AppError::new(
+                    AppErrorKind::Io,
+                    "no candidate BCD volume device syntax was available",
+                )
+            })?;
         let ramdisk_device_base =
             format!("ramdisk={}{}", volume_spec.ramdisk_prefix, ramdisk_wim_path);
         let ramdisk_device = format!("{ramdisk_device_base},{ramdisk_options_id}");
@@ -463,7 +487,7 @@ fn remove_boot_entry_impl(_entry_id: &str, _ramdisk_options_id: &str) -> AppResu
 }
 
 #[cfg(windows)]
-fn remove_staged_payload_impl(stage_root: &Path) -> AppResult<()> {
+fn remove_staged_payload_impl(stage_root: &Path, esp_stage_root: &Path) -> AppResult<()> {
     if stage_root.exists() {
         fs::remove_dir_all(stage_root).map_err(|error| {
             AppError::new(
@@ -475,11 +499,22 @@ fn remove_staged_payload_impl(stage_root: &Path) -> AppResult<()> {
             )
         })?;
     }
+    if esp_stage_root.exists() {
+        fs::remove_dir_all(esp_stage_root).map_err(|error| {
+            AppError::new(
+                AppErrorKind::Io,
+                format!(
+                    "failed to remove staged WinPE ESP payload at {}: {error}",
+                    esp_stage_root.display()
+                ),
+            )
+        })?;
+    }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn remove_staged_payload_impl(_stage_root: &Path) -> AppResult<()> {
+fn remove_staged_payload_impl(_stage_root: &Path, _esp_stage_root: &Path) -> AppResult<()> {
     Err(AppError::new(
         AppErrorKind::UnsupportedEnvironment,
         "PartBooter staged-payload cleanup only runs on Windows hosts",
@@ -541,41 +576,18 @@ fn locate_boot_sdi_source() -> AppResult<PathBuf> {
 }
 
 #[cfg(windows)]
-fn configure_ramdisk_options(
-    ramdisk_options_id: &str,
-    ramdisk_sdi_path: &str,
-    volume_token: &str,
-) -> AppResult<BcdVolumeSpec> {
-    let mut last_error = None;
-    for spec in candidate_bcd_volume_specs(volume_token) {
-        match set_bcd_value(
-            ramdisk_options_id,
-            "ramdisksdidevice",
-            &spec.partition_device,
-        ) {
-            Ok(()) => {
-                set_bcd_value(ramdisk_options_id, "ramdisksdipath", ramdisk_sdi_path)?;
-                return Ok(spec);
-            }
-            Err(error) => {
-                last_error = Some(AppError::new(
-                    error.kind(),
-                    format!(
-                        "failed to set ramdisksdidevice using {}: {}",
-                        spec.partition_device,
-                        error.message()
-                    ),
-                ));
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
+fn configure_ramdisk_options(ramdisk_options_id: &str, ramdisk_sdi_path: &str) -> AppResult<()> {
+    set_bcd_value(ramdisk_options_id, "ramdisksdidevice", "boot").map_err(|error| {
         AppError::new(
-            AppErrorKind::Io,
-            "no candidate BCD volume device syntax was available",
+            error.kind(),
+            format!(
+                "failed to set ramdisksdidevice using boot: {}",
+                error.message()
+            ),
         )
-    }))
+    })?;
+    set_bcd_value(ramdisk_options_id, "ramdisksdipath", ramdisk_sdi_path)?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -854,6 +866,20 @@ fn normalize_root_path(path: &str) -> PathBuf {
         PathBuf::from(path)
     } else {
         PathBuf::from(format!("{path}\\"))
+    }
+}
+
+#[cfg(windows)]
+fn resolve_esp_access_root(esp: &EspInfo) -> AppResult<PathBuf> {
+    if is_usable_mount_point(&esp.mount_point) {
+        Ok(normalize_root_path(&esp.mount_point))
+    } else if !esp.volume.trim().is_empty() {
+        Ok(normalize_root_path(&esp.volume))
+    } else {
+        Err(AppError::new(
+            AppErrorKind::Validation,
+            "unable to resolve a writable ESP root path for boot.sdi staging",
+        ))
     }
 }
 

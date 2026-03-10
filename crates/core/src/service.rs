@@ -228,7 +228,7 @@ impl PartBooterService {
 
         let journal = match plan.payload.kind {
             PayloadKind::WinPe => {
-                self.apply_winpe_plan(plan, &operation_id, &operation_root, &checkpoint)?
+                self.apply_winpe_plan(plan, &probe, &operation_id, &operation_root, &checkpoint)?
             }
             _ => {
                 let steps = plan
@@ -328,7 +328,7 @@ impl PartBooterService {
         let operation_root = self.journal_store.operation_dir(operation_id);
         if let Some(metadata) = self.read_winpe_operation_metadata(&operation_root)? {
             self.remove_registered_entry(&metadata.entry_id, &metadata.ramdisk_options_id)?;
-            self.remove_staged_payload(&metadata.stage_root)?;
+            self.remove_staged_payload(&metadata.stage_root, &metadata.esp_stage_root)?;
             self.remove_winpe_operation_metadata(&operation_root)?;
         }
         journal.status = OperationStatus::RolledBack;
@@ -443,11 +443,13 @@ impl PartBooterService {
     fn apply_winpe_plan(
         &self,
         plan: &ExecutionPlan,
+        probe: &partbooter_common::MachineProbe,
         operation_id: &str,
         operation_root: &Path,
         checkpoint: &BackupCheckpoint,
     ) -> AppResult<OperationJournal> {
         let staging = self.stage_winpe_payload(
+            probe,
             &plan.payload.source_path,
             &plan.target_volume,
             operation_id,
@@ -567,15 +569,19 @@ impl PartBooterService {
 
     fn stage_winpe_payload(
         &self,
+        probe: &partbooter_common::MachineProbe,
         source_path: &str,
         target_volume: &str,
         operation_id: &str,
         _operation_root: &Path,
     ) -> AppResult<WinPeStaging> {
         match &self.probe_source {
-            ProbeSource::Live => {
-                WindowsApplyAdapter::stage_winpe_payload(source_path, target_volume, operation_id)
-            }
+            ProbeSource::Live => WindowsApplyAdapter::stage_winpe_payload(
+                source_path,
+                target_volume,
+                operation_id,
+                &probe.esp,
+            ),
             #[cfg(test)]
             ProbeSource::Fixture(_) => {
                 self.create_fixture_winpe_staging(source_path, _operation_root)
@@ -616,13 +622,18 @@ impl PartBooterService {
         }
     }
 
-    fn remove_staged_payload(&self, stage_root: &Path) -> AppResult<()> {
+    fn remove_staged_payload(&self, stage_root: &Path, esp_stage_root: &Path) -> AppResult<()> {
         match &self.probe_source {
-            ProbeSource::Live => WindowsApplyAdapter::remove_staged_payload(stage_root),
+            ProbeSource::Live => {
+                WindowsApplyAdapter::remove_staged_payload(stage_root, esp_stage_root)
+            }
             #[cfg(test)]
             ProbeSource::Fixture(_) => {
                 if stage_root.exists() {
                     fs::remove_dir_all(stage_root)?;
+                }
+                if esp_stage_root.exists() && esp_stage_root != stage_root {
+                    fs::remove_dir_all(esp_stage_root)?;
                 }
                 Ok(())
             }
@@ -645,6 +656,7 @@ impl PartBooterService {
             format!("target_volume={}", staging.target_volume),
             format!("boot_wim_path={}", staging.boot_wim_path.display()),
             format!("boot_sdi_path={}", staging.boot_sdi_path.display()),
+            format!("boot_sdi_relative_path={}", staging.boot_sdi_relative_path),
             "path=\\Windows\\System32\\winload.efi".to_string(),
             "systemroot=\\Windows".to_string(),
             "winpe=yes".to_string(),
@@ -671,6 +683,10 @@ impl PartBooterService {
         fs::write(
             operation_root.join("staging-root.txt"),
             staging.stage_root.display().to_string(),
+        )?;
+        fs::write(
+            operation_root.join("esp-staging-root.txt"),
+            staging.esp_stage_root.display().to_string(),
         )?;
         fs::write(
             operation_root.join("boot-wim-path.txt"),
@@ -706,6 +722,11 @@ impl PartBooterService {
                     .trim()
                     .to_string(),
             ),
+            esp_stage_root: PathBuf::from(
+                fs::read_to_string(operation_root.join("esp-staging-root.txt"))?
+                    .trim()
+                    .to_string(),
+            ),
             boot_wim_path: PathBuf::from(
                 fs::read_to_string(operation_root.join("boot-wim-path.txt"))?
                     .trim()
@@ -729,6 +750,7 @@ impl PartBooterService {
             "entry-id.txt",
             "ramdisk-options-id.txt",
             "staging-root.txt",
+            "esp-staging-root.txt",
             "boot-wim-path.txt",
             "boot-sdi-path.txt",
             "loader-spec-path.txt",
@@ -773,8 +795,10 @@ impl PartBooterService {
 
         Ok(WinPeStaging {
             stage_root,
+            esp_stage_root: operation_root.join("fixture-esp-winpe"),
             boot_wim_path,
             boot_sdi_path,
+            boot_sdi_relative_path: r"\PartBooter\Operations\fixture\WinPE\boot.sdi".to_string(),
             target_volume: "D:".to_string(),
         })
     }
@@ -793,6 +817,7 @@ struct WinPeOperationMetadata {
     entry_id: String,
     ramdisk_options_id: String,
     stage_root: PathBuf,
+    esp_stage_root: PathBuf,
     boot_wim_path: PathBuf,
     boot_sdi_path: PathBuf,
     loader_spec_path: PathBuf,
