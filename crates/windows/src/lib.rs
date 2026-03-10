@@ -698,11 +698,12 @@ fn candidate_bcd_volume_specs(volume_token: &str) -> Vec<BcdVolumeSpec> {
 
 #[cfg(windows)]
 fn resolve_native_volume_device(volume_token: &str) -> Option<String> {
+    let aliases = volume_aliases(volume_token);
     let output = Command::new("fltmc").arg("volumes").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    parse_fltmc_volume_device(&String::from_utf8_lossy(&output.stdout), volume_token)
+    parse_fltmc_volume_device(&String::from_utf8_lossy(&output.stdout), &aliases)
 }
 
 #[cfg(not(windows))]
@@ -712,7 +713,7 @@ fn resolve_native_volume_device(_volume_token: &str) -> Option<String> {
 }
 
 #[cfg(any(windows, test))]
-fn parse_fltmc_volume_device(output: &str, volume_token: &str) -> Option<String> {
+fn parse_fltmc_volume_device(output: &str, aliases: &[String]) -> Option<String> {
     let mut current_device = None::<String>;
 
     for raw_line in output.lines() {
@@ -726,14 +727,14 @@ fn parse_fltmc_volume_device(output: &str, volume_token: &str) -> Option<String>
         }
 
         if let Some(device) = parse_native_device_from_line(line) {
-            if line_mentions_volume_token(line, volume_token) {
+            if line_mentions_volume_alias(line, aliases) {
                 return Some(device.to_string());
             }
             current_device = Some(device.to_string());
             continue;
         }
 
-        if line_mentions_volume_token(line, volume_token) {
+        if line_mentions_volume_alias(line, aliases) {
             if let Some(device) = &current_device {
                 return Some(device.clone());
             }
@@ -754,13 +755,66 @@ fn parse_native_device_from_line(line: &str) -> Option<&str> {
 }
 
 #[cfg(any(windows, test))]
-fn line_mentions_volume_token(line: &str, volume_token: &str) -> bool {
-    let normalized = volume_token.trim().trim_end_matches(['\\', '/']);
+fn line_mentions_volume_alias(line: &str, aliases: &[String]) -> bool {
     line.split_whitespace().any(|segment| {
-        segment
-            .trim_matches(|c| c == '(' || c == ')' || c == ',')
-            .eq_ignore_ascii_case(normalized)
+        let normalized_segment =
+            segment.trim_matches(|c| matches!(c, '(' | ')' | ',' | '\\' | '/'));
+        aliases
+            .iter()
+            .any(|alias| normalized_segment.eq_ignore_ascii_case(alias))
     })
+}
+
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn normalize_volume_alias(alias: &str) -> String {
+    alias
+        .trim()
+        .trim_matches(|c| matches!(c, '(' | ')' | ',' | '\\' | '/'))
+        .to_string()
+}
+
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn volume_aliases(volume_token: &str) -> Vec<String> {
+    let mut aliases = vec![normalize_volume_alias(volume_token)];
+
+    if let Some(guid_path) = resolve_volume_guid_path(volume_token) {
+        let normalized_guid = normalize_volume_alias(&guid_path);
+        if !normalized_guid.is_empty()
+            && !aliases
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&normalized_guid))
+        {
+            aliases.push(normalized_guid);
+        }
+    }
+
+    aliases
+}
+
+#[cfg(windows)]
+fn resolve_volume_guid_path(volume_token: &str) -> Option<String> {
+    let mount_target = format!("{volume_token}\\");
+    let output = Command::new("mountvol")
+        .args([mount_target.as_str(), "/L"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(r"\\?\Volume{"))
+        .map(str::to_string)
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_volume_guid_path(_volume_token: &str) -> Option<String> {
+    None
 }
 
 #[cfg(windows)]
@@ -1066,8 +1120,23 @@ C:
 D:
 "#;
 
-        let parsed = parse_fltmc_volume_device(output, "D:");
+        let parsed = parse_fltmc_volume_device(output, &[String::from("D:")]);
         assert_eq!(parsed.as_deref(), Some(r"\Device\HarddiskVolume7"));
+    }
+
+    #[test]
+    fn parses_native_volume_device_when_fltmc_uses_trailing_backslash_aliases() {
+        let output = r#"
+Filter Manager volumes
+----------------------
+Volume Name                                Altitude   Frame
+-----------------------------------------  --------   -----
+\Device\HarddiskVolume9                    0          0
+D:\
+"#;
+
+        let parsed = parse_fltmc_volume_device(output, &[String::from("D:")]);
+        assert_eq!(parsed.as_deref(), Some(r"\Device\HarddiskVolume9"));
     }
 
     #[test]
