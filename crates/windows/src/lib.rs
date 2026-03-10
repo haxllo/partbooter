@@ -336,12 +336,14 @@ fn create_backup_checkpoint_impl(
 #[cfg(windows)]
 fn stage_winpe_payload_impl(
     source_wim: &Path,
-    target_volume: &str,
+    _target_volume: &str,
     operation_id: &str,
-    esp: &EspInfo,
+    _esp: &EspInfo,
 ) -> AppResult<WinPeStaging> {
-    let target_root = normalize_volume_root(target_volume)?;
-    let stage_root = target_root
+    let boot_volume = system_volume_token()?;
+    let boot_root = normalize_volume_root(&boot_volume)?;
+    let stage_root = boot_root
+        .join("Boot")
         .join("PartBooter")
         .join("Operations")
         .join(operation_id)
@@ -361,14 +363,8 @@ fn stage_winpe_payload_impl(
     })?;
 
     let boot_sdi_source = locate_boot_sdi_source()?;
-    let esp_root = resolve_esp_access_root(esp)?;
-    let esp_stage_root = esp_root
-        .join("PartBooter")
-        .join("Operations")
-        .join(operation_id)
-        .join("WinPE");
-    fs::create_dir_all(&esp_stage_root)?;
-    let boot_sdi_path = esp_stage_root.join("boot.sdi");
+    let esp_stage_root = stage_root.clone();
+    let boot_sdi_path = stage_root.join("boot.sdi");
     fs::copy(&boot_sdi_source, &boot_sdi_path).map_err(|error| {
         AppError::new(
             AppErrorKind::Io,
@@ -385,8 +381,10 @@ fn stage_winpe_payload_impl(
         esp_stage_root,
         boot_wim_path,
         boot_sdi_path,
-        boot_sdi_relative_path: format!(r"\PartBooter\Operations\{operation_id}\WinPE\boot.sdi"),
-        target_volume: normalized_volume_token(target_volume)?,
+        boot_sdi_relative_path: format!(
+            r"\Boot\PartBooter\Operations\{operation_id}\WinPE\boot.sdi"
+        ),
+        target_volume: boot_volume,
     })
 }
 
@@ -413,22 +411,34 @@ fn register_winpe_boot_entry_impl(
     let registration = (|| {
         let volume_token = &staging.target_volume;
         let ramdisk_wim_path = windows_volume_relative_path(&staging.boot_wim_path, volume_token)?;
-        configure_ramdisk_options(&ramdisk_options_id, &staging.boot_sdi_relative_path)?;
-        let volume_spec = candidate_bcd_volume_specs(volume_token)
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                AppError::new(
-                    AppErrorKind::Io,
-                    "no candidate BCD volume device syntax was available",
-                )
-            })?;
-        let ramdisk_device_base =
-            format!("ramdisk={}{}", volume_spec.ramdisk_prefix, ramdisk_wim_path);
+        configure_ramdisk_options(
+            &ramdisk_options_id,
+            &staging.boot_sdi_relative_path,
+            volume_token,
+        )?;
+        let ramdisk_device_base = format!("ramdisk=[{volume_token}]{}", ramdisk_wim_path);
         let ramdisk_device = format!("{ramdisk_device_base},{ramdisk_options_id}");
 
-        set_bcd_value(&entry_id, "device", &ramdisk_device)?;
-        set_bcd_value(&entry_id, "osdevice", &ramdisk_device)?;
+        set_bcd_value(&entry_id, "device", &ramdisk_device).map_err(|error| {
+            AppError::new(
+                error.kind(),
+                format!(
+                    "failed to set device to {}: {}",
+                    ramdisk_device,
+                    error.message()
+                ),
+            )
+        })?;
+        set_bcd_value(&entry_id, "osdevice", &ramdisk_device).map_err(|error| {
+            AppError::new(
+                error.kind(),
+                format!(
+                    "failed to set osdevice to {}: {}",
+                    ramdisk_device,
+                    error.message()
+                ),
+            )
+        })?;
         set_bcd_value(&entry_id, "path", r"\Windows\System32\winload.efi")?;
         set_bcd_value(&entry_id, "systemroot", r"\Windows")?;
         set_bcd_value(&entry_id, "winpe", "yes")?;
@@ -584,12 +594,18 @@ fn locate_boot_sdi_source() -> AppResult<PathBuf> {
 }
 
 #[cfg(windows)]
-fn configure_ramdisk_options(ramdisk_options_id: &str, ramdisk_sdi_path: &str) -> AppResult<()> {
-    set_bcd_value(ramdisk_options_id, "ramdisksdidevice", "boot").map_err(|error| {
+fn configure_ramdisk_options(
+    ramdisk_options_id: &str,
+    ramdisk_sdi_path: &str,
+    volume_token: &str,
+) -> AppResult<()> {
+    let partition_device = format!("partition={volume_token}");
+    set_bcd_value(ramdisk_options_id, "ramdisksdidevice", &partition_device).map_err(|error| {
         AppError::new(
             error.kind(),
             format!(
-                "failed to set ramdisksdidevice using boot: {}",
+                "failed to set ramdisksdidevice using {}: {}",
+                partition_device,
                 error.message()
             ),
         )
@@ -915,17 +931,9 @@ fn normalize_root_path(path: &str) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn resolve_esp_access_root(esp: &EspInfo) -> AppResult<PathBuf> {
-    if is_usable_mount_point(&esp.mount_point) {
-        Ok(normalize_root_path(&esp.mount_point))
-    } else if !esp.volume.trim().is_empty() {
-        Ok(normalize_root_path(&esp.volume))
-    } else {
-        Err(AppError::new(
-            AppErrorKind::Validation,
-            "unable to resolve a writable ESP root path for boot.sdi staging",
-        ))
-    }
+fn system_volume_token() -> AppResult<String> {
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    normalized_volume_token(&system_drive)
 }
 
 #[cfg(windows)]
