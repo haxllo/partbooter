@@ -273,17 +273,7 @@ fn create_backup_checkpoint_impl(esp: &EspInfo, backup_root: &Path) -> AppResult
     let robocopy_code = Command::new("robocopy")
         .arg(&esp_source)
         .arg(&esp_backup_dir)
-        .args([
-            "/E",
-            "/COPY:DAT",
-            "/R:1",
-            "/W:1",
-            "/NFL",
-            "/NDL",
-            "/NJH",
-            "/NJS",
-            "/NP",
-        ])
+        .args(esp_backup_robocopy_args())
         .status()?
         .code()
         .unwrap_or(16);
@@ -313,7 +303,7 @@ fn create_backup_checkpoint_impl(esp: &EspInfo, backup_root: &Path) -> AppResult
         esp_backup_dir,
         bcd_store_path,
         notes: vec![
-            "ESP backup created with robocopy.".to_string(),
+            "ESP backup created with robocopy; live BCD files were excluded because bcdedit exported the store separately.".to_string(),
             "BCD snapshot exported with bcdedit.".to_string(),
         ],
     })
@@ -695,6 +685,28 @@ fn robocopy_succeeded(code: i32) -> bool {
 }
 
 #[cfg(any(windows, test))]
+fn esp_backup_robocopy_args() -> [&'static str; 16] {
+    [
+        "/E",
+        "/COPY:DAT",
+        "/R:1",
+        "/W:1",
+        "/NFL",
+        "/NDL",
+        "/NJH",
+        "/NJS",
+        "/NP",
+        "/XF",
+        "BCD",
+        "BCD.LOG",
+        "BCD.LOG1",
+        "BCD.LOG2",
+        "BCD.LOG*",
+        "BCD.TMP",
+    ]
+}
+
+#[cfg(any(windows, test))]
 fn parse_probe_output(output: &str) -> AppResult<MachineProbe> {
     let mut host_platform = None;
     let mut firmware_mode = None;
@@ -858,5 +870,14 @@ mod tests {
         assert!(robocopy_succeeded(0));
         assert!(robocopy_succeeded(7));
         assert!(!robocopy_succeeded(8));
+    }
+
+    #[test]
+    fn esp_backup_excludes_live_bcd_files() {
+        let args = super::esp_backup_robocopy_args();
+        assert!(args.contains(&"/XF"));
+        assert!(args.contains(&"BCD"));
+        assert!(args.contains(&"BCD.LOG"));
+        assert!(args.contains(&"BCD.LOG*"));
     }
 }
